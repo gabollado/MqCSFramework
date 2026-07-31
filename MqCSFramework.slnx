@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MqCSFramework.Abstractions/MqCSFramework.Abstractions.csproj" />
+    <Project Path="src/MqCSFramework.Hosting/MqCSFramework.Hosting.csproj" />
+    <Project Path="src/MqCSFramework.InMemory/MqCSFramework.InMemory.csproj" />
+    <Project Path="src/MqCSFramework.RabbitMQ/MqCSFramework.RabbitMQ.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MqCSFramework.Abstractions.Tests/MqCSFramework.Abstractions.Tests.csproj" />
+    <Project Path="tests/MqCSFramework.InMemory.Tests/MqCSFramework.InMemory.Tests.csproj" />
+    <Project Path="tests/MqCSFramework.Integration.Tests/MqCSFramework.Integration.Tests.csproj" />
+    <Project Path="tests/MqCSFramework.RabbitMQ.Tests/MqCSFramework.RabbitMQ.Tests.csproj" />
+    <Project Path="tests/MqCSFramework.Routing.Tests/MqCSFramework.Routing.Tests.csproj" />
+  </Folder>
+</Solution>

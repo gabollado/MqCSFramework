@@ -1,0 +1,12 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>In-memory transport implementation for MqCSFramework (testing and development)</Description>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MqCSFramework.Abstractions\MqCSFramework.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>
