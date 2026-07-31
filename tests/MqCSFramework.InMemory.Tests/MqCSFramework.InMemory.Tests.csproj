@@ -18,10 +18,4 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
-  <ItemGroup>
-    <ProjectReference Include="..\..\src\MqCSFramework.Abstractions\MqCSFramework.Abstractions.csproj" />
-    <ProjectReference Include="..\..\src\MqCSFramework.InMemory\MqCSFramework.InMemory.csproj" />
-    <ProjectReference Include="..\..\src\MqCSFramework.Hosting\MqCSFramework.Hosting.csproj" />
-  </ItemGroup>
-
 </Project>

@@ -1,7 +1,6 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
-    <ProjectReference Include="..\MqCSFramework.Samples.Contracts\MqCSFramework.Samples.Contracts.csproj" />
     <ProjectReference Include="..\..\src\MqCSFramework.Hosting\MqCSFramework.Hosting.csproj" />
     <ProjectReference Include="..\..\src\MqCSFramework.InMemory\MqCSFramework.InMemory.csproj" />
   </ItemGroup>
