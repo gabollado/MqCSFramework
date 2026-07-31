@@ -81,7 +81,7 @@ graph TB
 ### Message Flow — RPC Pattern
 
 1. Sender calls `IRpcSender.SendAsync<TProcessor, TResponse, TRequest>(request)`
-2. Framework creates a temporary reply queue (or uses Direct Reply-to)
+2. Framework declares an exclusive reply queue named `{queueName}.reply.{GUID}` (unique per sender instance)
 3. Framework sets headers: `mq-processor-type`, `mq-pattern` = `"rpc"`, plus `ReplyTo` and `CorrelationId`
 4. Consumer receives, resolves processor, calls `ProcessAsync` which returns `TResponse`
 5. Consumer serializes response and publishes to the reply queue
@@ -97,7 +97,7 @@ namespace MqCSFramework;
 
 /// <summary>
 /// Base interface for standard message processors.
-/// Implement this in a contract interface shared between sender and consumer.
+/// Define a contract interface inheriting this in your shared contracts package.
 /// </summary>
 public interface IMessageProcessor<in TMessage> where TMessage : class
 {
@@ -106,12 +106,99 @@ public interface IMessageProcessor<in TMessage> where TMessage : class
 
 /// <summary>
 /// Base interface for RPC processors that return a response.
-/// Implement this in a contract interface shared between sender and consumer.
+/// Define a contract interface inheriting this in your shared contracts package.
 /// </summary>
 public interface IRpcProcessor<in TRequest, TResponse> where TRequest : class where TResponse : class
 {
     Task<TResponse> ProcessAsync(TRequest request, MessageContext context, CancellationToken ct = default);
 }
+```
+
+### Abstract Base Classes (Processor implementations inherit from these)
+
+The consumer dispatches via the non-generic base interfaces (`IMessageProcessor`, `IRpcProcessor`) which have raw byte methods. The abstract base classes implement deserialization and delegate to the typed `ProcessAsync`.
+
+```csharp
+namespace MqCSFramework;
+
+/// <summary>
+/// Non-generic base interface for standard processors.
+/// The consumer calls ProcessRawAsync — no reflection needed.
+/// </summary>
+public interface IMessageProcessor
+{
+    Task ProcessRawAsync(ReadOnlyMemory<byte> body, MessageContext context, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Generic interface extending the non-generic base. Defines the typed ProcessAsync.
+/// </summary>
+public interface IMessageProcessor<in TMessage> : IMessageProcessor where TMessage : class
+{
+    Task ProcessAsync(TMessage message, MessageContext context, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Non-generic base interface for RPC processors.
+/// The consumer calls ProcessRawRpcAsync — no reflection needed.
+/// </summary>
+public interface IRpcProcessor
+{
+    Task<byte[]> ProcessRawRpcAsync(ReadOnlyMemory<byte> body, MessageContext context, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Generic interface extending the non-generic base. Defines the typed ProcessAsync.
+/// </summary>
+public interface IRpcProcessor<in TRequest, TResponse> : IRpcProcessor where TRequest : class where TResponse : class
+{
+    Task<TResponse> ProcessAsync(TRequest request, MessageContext context, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Abstract base class for standard processors.
+/// Implements ProcessRawAsync: deserializes the body and calls the typed ProcessAsync.
+/// </summary>
+public abstract class StandardProcessor<TMessage> : IMessageProcessor<TMessage>
+    where TMessage : class
+{
+    public Task ProcessRawAsync(ReadOnlyMemory<byte> body, MessageContext context, CancellationToken ct = default)
+    {
+        var message = JsonSerializer.Deserialize<TMessage>(body.Span)!;
+        return ProcessAsync(message, context, ct);
+    }
+
+    public abstract Task ProcessAsync(TMessage message, MessageContext context, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Abstract base class for RPC processors.
+/// Implements ProcessRawRpcAsync: deserializes, calls typed ProcessAsync, serializes response.
+/// </summary>
+public abstract class RpcProcessor<TRequest, TResponse> : IRpcProcessor<TRequest, TResponse>
+    where TRequest : class
+    where TResponse : class
+{
+    public async Task<byte[]> ProcessRawRpcAsync(ReadOnlyMemory<byte> body, MessageContext context, CancellationToken ct = default)
+    {
+        var request = JsonSerializer.Deserialize<TRequest>(body.Span)!;
+        var response = await ProcessAsync(request, context, ct);
+        return JsonSerializer.SerializeToUtf8Bytes(response);
+    }
+
+    public abstract Task<TResponse> ProcessAsync(TRequest request, MessageContext context, CancellationToken ct = default);
+}
+```
+
+**Consumer dispatch (no reflection, no extra interfaces):**
+```csharp
+// Standard:
+if (processor is IMessageProcessor standardProcessor)
+    await standardProcessor.ProcessRawAsync(ea.Body, context, ct);
+
+// RPC:
+if (processor is IRpcProcessor rpcProcessor)
+    var responseBytes = await rpcProcessor.ProcessRawRpcAsync(ea.Body, context, ct);
 ```
 
 ### Sender Interfaces
@@ -327,10 +414,12 @@ internal sealed class MqConsumer : IAsyncDisposable
         // 1. Read mq-processor-type header → Type.GetType(value)
         // 2. Read mq-pattern header ("standard" or "rpc")
         // 3. Resolve processor from DI: _serviceProvider.GetService(processorType)
-        // 4. Deserialize body based on pattern
-        // 5. If standard: call ProcessAsync, ACK on success, NACK on failure
-        // 6. If RPC: call ProcessAsync, serialize response, publish to ReplyTo, ACK
-        // 7. Track retry count via x-death header or custom header; dead-letter if exceeded
+        // 4. If standard: cast to IProcessorDispatch → call DispatchAsync(body, context, ct)
+        //    The base class (StandardProcessor<T>) deserializes and calls typed ProcessAsync
+        // 5. If RPC: cast to IRpcProcessorDispatch → call DispatchRpcAsync(body, context, ct)
+        //    The base class (RpcProcessor<TReq, TRes>) deserializes, calls ProcessAsync, serializes response
+        // 6. On success: ACK. On failure: retry logic (increment mq-retry-count, dead-letter if exceeded)
+        // NO REFLECTION — dispatch is a simple interface cast + method call
     }
 
     public async ValueTask DisposeAsync()
@@ -477,7 +566,7 @@ internal sealed class RabbitMqRpcSender : IRpcSender
             {
                 MessageId = messageId,
                 CorrelationId = correlationId,
-                ReplyTo = "amq.rabbitmq.reply-to", // Direct Reply-to
+                ReplyTo = _replyQueueName, // "{routingKey}.reply.{guid}" — unique per sender instance
                 Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
                 ContentType = "application/json",
                 Headers = new Dictionary<string, object?>
@@ -542,7 +631,7 @@ Messages on the wire have this structure:
 | Property: `MessageId` | GUID string |
 | Property: `CorrelationId` | GUID string (links request to response) |
 | Property: `Timestamp` | Unix epoch seconds |
-| Property: `ReplyTo` | Reply queue (RPC only, uses Direct Reply-to) |
+| Property: `ReplyTo` | Reply queue name (RPC only, format: `{queueName}.reply.{GUID}`) |
 | Property: `ContentType` | `"application/json"` |
 
 ### RPC Response Envelope
@@ -770,6 +859,40 @@ flowchart TD
 - Multiple independent connections to different virtual hosts
 - Dead-letter exchange routing with actual broker
 
+### Source Project Structure
+
+```
+src/MqCSFramework/
+  Configuration/              ← Options classes
+    RabbitMqConnectionOptions.cs
+    StandardSenderOptions.cs
+    RpcSenderOptions.cs
+    ConsumerOptions.cs
+    SendOptions.cs
+    RpcOptions.cs
+  Exceptions/                 ← Custom exception types
+    RpcTimeoutException.cs
+    RpcRemoteException.cs
+    MessageSerializationException.cs
+  Internal/                   ← Internal implementations (not public API)
+    RabbitMqConnection.cs
+    RabbitMqStandardSender.cs
+    RabbitMqRpcSender.cs
+    MqConsumer.cs
+    ConsumerHostedService.cs
+    RpcResponseEnvelope.cs
+  IMessageProcessor.cs        ← Processor interfaces (non-generic + generic)
+  IRpcProcessor.cs
+  IStandardSender.cs          ← Sender interfaces
+  IRpcSender.cs
+  StandardProcessor.cs        ← Abstract base classes
+  RpcProcessor.cs
+  MessageContext.cs            ← Message metadata record
+  MqHeaders.cs                ← Header constants
+  MqBuilder.cs                ← Fluent DI builder
+  ServiceCollectionExtensions.cs
+```
+
 ### Test Project Structure
 
 ```
@@ -942,9 +1065,9 @@ using MyApp.Contracts.Processors;
 
 namespace MyApp.Consumer.Processors;
 
-public class OrderProcessor(ILogger<OrderProcessor> logger) : IOrderProcessor
+public class OrderProcessor(ILogger<OrderProcessor> logger) : StandardProcessor<OrderMessage>, IOrderProcessor
 {
-    public async Task ProcessAsync(OrderMessage message, MessageContext context, CancellationToken ct = default)
+    public override async Task ProcessAsync(OrderMessage message, MessageContext context, CancellationToken ct = default)
     {
         logger.LogInformation("Processing order {OrderId} for {Customer}",
             message.OrderId, message.CustomerName);
@@ -963,9 +1086,9 @@ using MyApp.Contracts.Processors;
 
 namespace MyApp.Consumer.Processors;
 
-public class StockProcessor(ILogger<StockProcessor> logger) : IStockProcessor
+public class StockProcessor(ILogger<StockProcessor> logger) : RpcProcessor<StockRequest, StockResponse>, IStockProcessor
 {
-    public Task<StockResponse> ProcessAsync(StockRequest request, MessageContext context, CancellationToken ct = default)
+    public override Task<StockResponse> ProcessAsync(StockRequest request, MessageContext context, CancellationToken ct = default)
     {
         logger.LogInformation("Checking stock for SKU {Sku}, quantity {Qty}",
             request.Sku, request.Quantity);

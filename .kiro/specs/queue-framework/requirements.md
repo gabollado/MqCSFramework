@@ -44,8 +44,9 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 2. The send method signature is `SendAsync<TProcessor, TResponse>(TRequest request, ...)` where `TProcessor : IRpcProcessor<TRequest, TResponse>` — request and response types are checked at compile time
 3. The processor interface's AssemblyQualifiedName is set as the `mq-processor-type` message header
 4. An additional header identifies the message pattern as "rpc" (so the consumer knows which base interface to cast to)
-5. The consumer processes the request and publishes the response to the reply queue
-6. Responses are correlated by message ID
+5. The RPC sender declares an exclusive reply queue named `{routingKey}.reply.{GUID}` (unique per sender instance)
+6. The consumer processes the request and publishes the response to the reply queue specified in the ReplyTo property
+7. Responses are correlated by correlation ID
 7. Timeout produces `RpcTimeoutException`
 8. Consumer errors are propagated as `RpcRemoteException` to the sender
 
@@ -55,14 +56,16 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 
 #### Acceptance Criteria
 
-1. Processors are registered by the developer as standard DI singletons: `services.AddSingleton<IMyProcessor, MyProcessorImpl>()`
-2. When a message arrives, the consumer reads the `mq-processor-type` header to get the processor interface name
-3. The consumer reads the pattern header ("standard" or "rpc") to know whether to cast to `IMessageProcessor<T>` or `IRpcProcessor<TReq, TRes>`
-4. The consumer resolves the processor singleton from DI using `Type.GetType(header)` + `serviceProvider.GetService(type)`
-5. The consumer calls the `ProcessAsync` method on the resolved processor interface
-6. The consumer does not need to know what specific processors exist — it just resolves by interface name and calls the process method
-7. Messages without the `mq-processor-type` header are rejected (NACK'd)
-8. Messages with an unregistered processor type are NACK'd and logged
+1. Processors inherit from abstract base classes: `StandardProcessor<TMessage>` (for standard) or `RpcProcessor<TRequest, TResponse>` (for RPC)
+2. Processor implementations are registered by the developer as standard DI singletons: `services.AddSingleton<IMyProcessor, MyProcessorImpl>()`
+3. The generic interfaces extend non-generic base interfaces (`IMessageProcessor`, `IRpcProcessor`) with raw byte methods (`ProcessRawAsync`, `ProcessRawRpcAsync`) — the abstract base classes implement deserialization internally
+4. When a message arrives, the consumer reads the `mq-processor-type` header to get the processor interface name
+5. The consumer reads the `mq-pattern` header ("standard" or "rpc") to determine which non-generic interface to cast to
+6. The consumer resolves the processor singleton from DI using `Type.GetType(header)` + `serviceProvider.GetService(type)`
+7. For standard: casts to `IMessageProcessor` (non-generic) and calls `ProcessRawAsync(body, context, ct)`
+8. For RPC: casts to `IRpcProcessor` (non-generic) and calls `ProcessRawRpcAsync(body, context, ct)`
+9. Messages without the `mq-processor-type` header are rejected (NACK'd)
+10. Messages with an unregistered processor type are NACK'd and logged
 
 ### Requirement 4: Independent Connections
 

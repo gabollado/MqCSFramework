@@ -1,5 +1,8 @@
 <Solution>
-  <Folder Name="/samples/" />
-  <Folder Name="/src/" />
-  <Folder Name="/tests/" />
+  <Folder Name="/src/">
+    <Project Path="src/MqCSFramework/MqCSFramework.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MqCSFramework.Tests/MqCSFramework.Tests.csproj" />
+  </Folder>
 </Solution>
