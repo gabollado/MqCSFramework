@@ -6,8 +6,8 @@ Implement the MqCSFramework message queue framework building on the existing ske
 
 ## Tasks
 
-- [ ] 1. Implement serialization and core utilities
-  - [ ] 1.1 Implement the default System.Text.Json serializer
+- [x] 1. Implement serialization and core utilities
+  - [x] 1.1 Implement the default System.Text.Json serializer
     - Create `JsonMessageSerializer` class implementing `IMessageSerializer` in `MqCSFramework.Abstractions/Serialization/`
     - Use `System.Text.Json` with sensible defaults (camelCase, allow reading from string numbers)
     - Throw `MessageSerializationException` with context on failures (message ID, target type)
@@ -21,7 +21,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Use FsCheck to generate arbitrary message objects, verify `Deserialize(Serialize(msg)) == msg`
     - Test with various types: primitives in records, nested objects, collections
 
-  - [ ] 1.3 Implement MessageMasker utility
+  - [x] 1.3 Implement MessageMasker utility
     - Create `MessageMasker` internal static class in `MqCSFramework.Abstractions/` (or a shared internal location)
     - Implement `Mask(string json, HashSet<string>? maskedFields)` — case-insensitive field name matching
     - Implement `BuildFieldSet(IList<string>? fieldNames)` returning a `HashSet<string>(StringComparer.OrdinalIgnoreCase)`
@@ -35,23 +35,23 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Verify masked fields have `"***MASKED***"` value, non-masked fields remain unchanged
     - Case-insensitive field matching property
 
-- [ ] 2. Implement ProcessorRouter and processor type resolution
-  - [ ] 2.1 Implement ProcessorRouter with dual-lookup routing
-    - Create `ProcessorRouter` internal class (in a shared internal location, e.g., `MqCSFramework.Abstractions` or a new internal helpers area accessible to consumers)
-    - Implement primary route: look up `mq-processor-type` header → resolve processor registration
-    - Implement fallback route: look up `mq-message-type` header → resolve processor registration
-    - NACK with `UnknownMessageTypeException` if neither lookup finds a match
-    - Use `Dictionary<string, ProcessorRegistration>` and `Dictionary<string, RpcProcessorRegistration>` for O(1) routing
-    - Implement `RouteStandardAsync` and `RouteRpcAsync` methods
-    - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 8.8_
+- [x] 2. Implement MessageDispatcher
+  - [x] 2.1 Implement MessageDispatcher with direct DI resolution
+    - Create `MessageDispatcher` internal class in `MqCSFramework.Abstractions/Internal/`
+    - Dispatch: read `mq-processor-type` header → `Type.GetType(headerValue)` → resolve from DI → call ProcessAsync
+    - Cache the TMessage/TRequest type for each processor interface (resolved once from generic args)
+    - NACK with `UnknownMessageTypeException` if the header is missing or the type can't be resolved from DI
+    - No routing dictionary, no ProcessorRegistration, no ProcessorTypeResolver
+    - Implement `DispatchStandardAsync` and `DispatchRpcAsync` methods
+    - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.8_
 
   - [ ]* 2.2 Write property test for message routing correctness (Property 2)
     - **Property 2: Message Routing Correctness**
     - **Validates: Requirements 2.5, 5.3, 8.2, 8.4**
-    - In `MqCSFramework.Routing.Tests`, create `ProcessorRouterPropertyTests.cs`
-    - For N registered processors, verify routing by `mq-processor-type` header invokes exactly the correct processor
-    - Verify fallback to `MessageType` header when processor header is absent
-    - Verify unknown types produce NACK
+    - In `MqCSFramework.Routing.Tests`, create `MessageDispatcherPropertyTests.cs`
+    - For N registered processors, verify dispatch by `mq-processor-type` header invokes exactly the correct processor
+    - Verify messages without the header are rejected (NACK'd)
+    - Verify unknown processor types produce NACK
 
   - [ ]* 2.3 Write property test for unknown message type NACK (Property 5)
     - **Property 5: Unknown Message Type NACK**
@@ -59,24 +59,11 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - In `MqCSFramework.Routing.Tests`, create `UnknownMessageTypePropertyTests.cs`
     - Verify messages with unrecognized type headers are NACK'd without requeue
 
-  - [ ] 2.4 Implement processor type resolution for SendAsync&lt;TProcessor&gt;
-    - Create `ProcessorTypeResolver` internal static helper
-    - Given a `TProcessor` type, resolve `TMessage` from `IMessageProcessor<TMessage>` or `TRequest`/`TResponse` from `IRpcProcessor<TRequest, TResponse>` via cached reflection
-    - Cache resolved types in a `ConcurrentDictionary<Type, ResolvedProcessorInfo>`
-    - Validate message assignability at send time
-    - _Requirements: 8.5, 8.6, 8.7_
-
-  - [ ]* 2.5 Write property test for processor type resolution (Property 18)
-    - **Property 18: Processor Type Resolution Correctness**
-    - **Validates: Requirements 2.1, 3.1, 8.1**
-    - In `MqCSFramework.Routing.Tests`, create `ProcessorTypeResolutionPropertyTests.cs`
-    - Verify that for any TProcessor implementing IMessageProcessor<T> or IRpcProcessor<TReq, TRes>, resolution produces correct generic arguments
-
-- [ ] 3. Checkpoint - Ensure all tests pass
+- [x] 3. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 4. Implement In-Memory transport
-  - [ ] 4.1 Implement InMemoryTransportConnection and InMemoryTransportChannel
+- [x] 4. Implement In-Memory transport
+  - [x] 4.1 Implement InMemoryTransportConnection and InMemoryTransportChannel
     - Flesh out `InMemoryTransportConnection` in `MqCSFramework.InMemory`
     - Use `ConcurrentDictionary<string, Channel<MessageEnvelope>>` for named queues
     - `IsConnected` always returns true (in-memory is always available)
@@ -85,7 +72,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - `AcknowledgeAsync` / `NegativeAcknowledgeAsync` are no-ops for in-memory
     - _Requirements: 13.1, 13.2_
 
-  - [ ] 4.2 Implement InMemoryStandardSender
+  - [x] 4.2 Implement InMemoryStandardSender
     - Create `InMemoryStandardSender : IMessageSender` in `MqCSFramework.InMemory`
     - Implement `SendAsync<TProcessor>`: resolve processor type → build `MessageEnvelope` with `mq-processor-type` header → publish
     - Implement `SendAsync<TMessage>`: build envelope with message type header → publish
@@ -93,14 +80,14 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Generate MessageId (GUID), set Timestamp, carry SendOptions metadata
     - _Requirements: 2.1, 2.2, 13.2, 13.4_
 
-  - [ ] 4.3 Implement InMemoryRpcSender
+  - [x] 4.3 Implement InMemoryRpcSender
     - Create `InMemoryRpcSender : IRpcSender` in `MqCSFramework.InMemory`
     - Use `ConcurrentDictionary<string, TaskCompletionSource<byte[]>>` for pending requests
     - Set up a reply channel; correlate responses by MessageId
     - Implement timeout via `CancellationTokenSource` → throw `RpcTimeoutException`
     - _Requirements: 3.1, 3.2, 3.4, 3.6, 13.3_
 
-  - [ ] 4.4 Implement InMemoryConsumer
+  - [x] 4.4 Implement InMemoryConsumer
     - Create `InMemoryConsumer : IMessageConsumer` in `MqCSFramework.InMemory`
     - Read from the in-memory channel in a loop, dispatch to `ProcessorRouter`
     - ACK on `ProcessResult.Success`, NACK on failure
@@ -150,29 +137,29 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - In `MqCSFramework.InMemory.Tests`, create `CorrelationIdPropertyTests.cs`
     - Verify correlation ID from send options arrives in processor's MessageContext unchanged
 
-- [ ] 5. Checkpoint - Ensure all tests pass
+- [x] 5. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 6. Implement DI builder and hosting
-  - [ ] 6.1 Implement MqCSFrameworkBuilder and ServiceCollectionExtensions
+- [x] 6. Implement DI builder and hosting
+  - [x] 6.1 Implement MqCSFrameworkBuilder and ServiceCollectionExtensions
     - Create `MqCSFrameworkBuilder` class and `ServiceCollectionExtensions` in `MqCSFramework.Hosting`
     - Implement `AddMqCSFramework(Action<MqCSFrameworkBuilder>)` extension method
     - Implement `AddSender`, `AddRpcSender`, `AddConsumer` — register as keyed services with per-instance connection options
     - Implement `AddInMemorySender`, `AddInMemoryConsumer` — register in-memory implementations
-    - Implement `AddProcessor<TProcessor, TMessage>` and `AddRpcProcessor<TProcessor, TRequest, TResponse>`
     - Implement `UseSerializer<T>` for custom serializer registration
     - Register `JsonMessageSerializer` as default `IMessageSerializer`
-    - Register `ProcessorRouter` with all processor mappings
+    - Register `ProcessorRouter` (which resolves processors directly from DI at runtime — no processor registration needed in the builder)
+    - Processors are registered by the user as standard DI singletons: `services.AddSingleton<IMyProcessor, MyProcessorImpl>()`
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
 
-  - [ ] 6.2 Implement ConsumerHostedService
+  - [x] 6.2 Implement ConsumerHostedService
     - Flesh out `ConsumerHostedService` in `MqCSFramework.Hosting`
     - In `ExecuteAsync`, resolve all registered `IMessageConsumer` instances and call `StartAsync`
     - On cancellation: call `StopAsync` on all consumers with a graceful timeout
     - Log consumer startup (queue name, connection name — no secrets)
     - _Requirements: 6.1, 6.2, 6.3, 6.4_
 
-  - [ ] 6.3 Implement TransportHealthCheck
+  - [x] 6.3 Implement TransportHealthCheck
     - Flesh out `TransportHealthCheck` in `MqCSFramework.Hosting`
     - Check `ITransportConnection.IsConnected` → Healthy
     - Report `Degraded` during recovery (if connection fires `ConnectionRecovered` event recently)
@@ -195,7 +182,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Verify each connection reports health independently — one degraded does not affect others
 
 - [ ] 7. Implement RabbitMQ transport
-  - [ ] 7.1 Implement RabbitMqTransportConnection with auto-reconnect
+  - [~] 7.1 Implement RabbitMqTransportConnection with auto-reconnect
     - Flesh out `RabbitMqTransportConnection` in `MqCSFramework.RabbitMQ`
     - Lazy init with `SemaphoreSlim`; build `ConnectionFactory` from `RabbitMqConnectionOptions`
     - Hook into `RabbitMQ.Client` connection shutdown/recovery events
@@ -204,7 +191,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Implement `IAsyncDisposable` — close connection gracefully
     - _Requirements: 7.1, 7.3, 7.4_
 
-  - [ ] 7.2 Implement RabbitMqTransportChannel
+  - [~] 7.2 Implement RabbitMqTransportChannel
     - Create `RabbitMqTransportChannel : ITransportChannel` in `MqCSFramework.RabbitMQ`
     - Wrap `RabbitMQ.Client.IChannel` operations
     - `PublishAsync` → `BasicPublishAsync` with `BasicProperties` mapped from `MessageEnvelope`
@@ -213,7 +200,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - `AcknowledgeAsync` → `BasicAckAsync`, `NegativeAcknowledgeAsync` → `BasicNackAsync`
     - _Requirements: 2.1, 2.4, 2.6, 2.7_
 
-  - [ ] 7.3 Implement RabbitMqStandardSender
+  - [~] 7.3 Implement RabbitMqStandardSender
     - Create `RabbitMqStandardSender : IMessageSender, IAsyncDisposable` in `MqCSFramework.RabbitMQ`
     - Owns its own `ITransportConnection` instance (dedicated connection)
     - Lazy channel creation, reset-on-failure pattern
@@ -222,7 +209,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Log message send (with body masking if configured)
     - _Requirements: 2.1, 2.2, 2.3, 7.2, 8.5, 8.6_
 
-  - [ ] 7.4 Implement RabbitMqRpcSender
+  - [~] 7.4 Implement RabbitMqRpcSender
     - Create `RabbitMqRpcSender : IRpcSender, IAsyncDisposable` in `MqCSFramework.RabbitMQ`
     - Owns its own `ITransportConnection` instance (dedicated connection)
     - Declare exclusive reply queue on channel init
@@ -231,7 +218,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Handle timeout → `RpcTimeoutException`, error response → `RpcRemoteException`
     - _Requirements: 3.1, 3.2, 3.4, 3.5, 3.6_
 
-  - [ ] 7.5 Implement RabbitMqConsumer
+  - [~] 7.5 Implement RabbitMqConsumer
     - Create `RabbitMqConsumer : IMessageConsumer` in `MqCSFramework.RabbitMQ`
     - Owns its own `ITransportConnection` instance (dedicated connection)
     - On `StartAsync`: connect, create channel, set prefetch, start consuming
@@ -241,7 +228,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Processing timeout per message via `CancellationTokenSource`
     - _Requirements: 2.4, 2.5, 2.6, 2.7, 3.3, 10.1, 10.2, 10.3_
 
-  - [ ] 7.6 Implement RabbitMQ configuration options classes
+  - [x] 7.6 Implement RabbitMQ configuration options classes
     - Create `RabbitMqSenderOptions`, `RabbitMqRpcSenderOptions`, `RabbitMqConsumerOptions` in `MqCSFramework.RabbitMQ`
     - Each contains its own `RabbitMqConnectionOptions Connection` property (independent per endpoint)
     - Include logging, masking, and retry configuration
@@ -254,11 +241,11 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Mock transport to simulate failure → verify channel is reset → subsequent call succeeds
     - Verify other senders are unaffected (connection isolation)
 
-- [ ] 8. Checkpoint - Ensure all tests pass
+- [~] 8. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 9. Implement OpenTelemetry tracing
-  - [ ] 9.1 Implement MqTracing with ActivitySource and W3C propagation
+  - [~] 9.1 Implement MqTracing with ActivitySource and W3C propagation
     - Create `MqTracing` internal static class (in `MqCSFramework.Abstractions` or a shared location)
     - Create `ActivitySource("MqCSFramework", "1.0.0")`
     - Implement `StartPublishActivity` — start producer span with messaging semantic convention tags
@@ -274,7 +261,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Verify inject→extract round-trip preserves trace ID and span ID in W3C format
 
 - [ ] 10. Implement error queue routing
-  - [ ] 10.1 Implement dead-letter/error queue logic in RabbitMqConsumer
+  - [~] 10.1 Implement dead-letter/error queue logic in RabbitMqConsumer
     - In `RabbitMqConsumer`, check `x-death` header count against `DelayRetryLimit`
     - When limit exceeded: ACK original message, publish to `ErrorQueueName`
     - When under limit: NACK without requeue (rely on DLX for retry)
@@ -288,7 +275,7 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - Simulate retry count exceeding limit → verify message routed to error queue
 
 - [ ] 11. Wire transport interchangeability
-  - [ ] 11.1 Ensure InMemory and RabbitMQ produce equivalent MessageContext
+  - [~] 11.1 Ensure InMemory and RabbitMQ produce equivalent MessageContext
     - Review both transport implementations to confirm `ReceivedMessage` → `MessageContext` mapping is consistent
     - Standardize header propagation, timestamp handling, and correlation ID flow across transports
     - Ensure processor code is fully transport-agnostic
@@ -300,35 +287,35 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - In `MqCSFramework.InMemory.Tests`, create `TransportInterchangeabilityPropertyTests.cs`
     - Send message through InMemory → verify MessageContext and deserialized message match expected output
 
-- [ ] 12. Checkpoint - Ensure all tests pass
+- [~] 12. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 13. Integration tests with RabbitMQ (Testcontainers)
-  - [ ] 13.1 Set up Testcontainers RabbitMQ infrastructure
+  - [~] 13.1 Set up Testcontainers RabbitMQ infrastructure
     - In `MqCSFramework.Integration.Tests`, add `Testcontainers.RabbitMq` NuGet package
     - Create a shared `RabbitMqFixture` class implementing `IAsyncLifetime`
     - Spin up a RabbitMQ container, expose connection string to tests
     - _Requirements: 1.2, 7.1_
 
-  - [ ] 13.2 Write integration test for standard messaging round-trip
+  - [~] 13.2 Write integration test for standard messaging round-trip
     - Full end-to-end: register sender + consumer + processor via DI builder
     - Send a message → verify processor receives it with correct deserialized content and context
     - Verify ACK is sent (message no longer on queue)
     - _Requirements: 2.1, 2.4, 2.5, 2.6_
 
-  - [ ] 13.3 Write integration test for RPC round-trip
+  - [~] 13.3 Write integration test for RPC round-trip
     - Register RPC sender + consumer + RPC processor
     - Send request → verify typed response returned to caller
     - Test timeout scenario (no consumer) → verify `RpcTimeoutException`
     - _Requirements: 3.1, 3.3, 3.4_
 
-  - [ ] 13.4 Write integration test for connection resilience
+  - [~] 13.4 Write integration test for connection resilience
     - Start consumer → force-close RabbitMQ connection via management API → verify auto-reconnect
     - Verify consumer resumes processing after reconnection
     - Verify independent connections: one sender failing does not affect another sender
     - _Requirements: 7.1, 7.2, 7.3_
 
-  - [ ] 13.5 Write integration test for consumer hosted service lifecycle
+  - [~] 13.5 Write integration test for consumer hosted service lifecycle
     - Use `WebApplicationFactory` or `HostBuilder` to start/stop consumer hosted service
     - Verify graceful shutdown: consumers stop, pending messages not lost
     - _Requirements: 6.1, 6.2, 6.3_
@@ -339,8 +326,32 @@ Implement the MqCSFramework message queue framework building on the existing ske
     - In `MqCSFramework.Integration.Tests`, create `ConnectionIsolationPropertyTests.cs`
     - Register multiple senders/consumers → fail one connection → verify others remain healthy
 
-- [ ] 14. Final checkpoint - Ensure all tests pass
+- [~] 14. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
+
+- [ ] 15. Sample projects (end-to-end demo)
+  - [ ] 15.1 Create shared contracts project (MqCSFramework.Samples.Contracts)
+    - Create a new class library project `samples/MqCSFramework.Samples.Contracts`
+    - Define a sample processor interface: `ISampleProcessor : IRpcProcessor<SampleRequest, SampleResponse>`
+    - Define `SampleRequest` record (e.g. `Name`, `Value` properties)
+    - Define `SampleResponse` record (e.g. `Result`, `ProcessedAt` properties)
+    - Reference only `MqCSFramework.Abstractions`
+    - Add project to solution
+
+  - [ ] 15.2 Create sample consumer console (MqCSFramework.Samples.Consumer)
+    - Create a new console app project `samples/MqCSFramework.Samples.Consumer`
+    - Implement `SampleProcessor : ISampleProcessor` with simple logic (echo request + timestamp)
+    - Wire up using `AddMqCSFramework` builder: register consumer + processor (use InMemory or RabbitMQ based on config)
+    - Use Generic Host (`Host.CreateApplicationBuilder`) with the ConsumerHostedService
+    - Reference Contracts, Hosting, InMemory (and optionally RabbitMQ)
+    - Add project to solution
+
+  - [ ] 15.3 Create sample sender console (MqCSFramework.Samples.Sender)
+    - Create a new console app project `samples/MqCSFramework.Samples.Sender`
+    - Send an RPC message using `SendAsync<ISampleProcessor>(new SampleRequest { ... })` and print the response
+    - Wire up using `AddMqCSFramework` builder: register RPC sender (use InMemory or RabbitMQ based on config)
+    - Reference Contracts, Hosting, InMemory (and optionally RabbitMQ)
+    - Add project to solution
 
 ## Notes
 
@@ -358,8 +369,8 @@ Implement the MqCSFramework message queue framework building on the existing ske
 {
   "waves": [
     { "id": 0, "tasks": ["1.1", "1.3"] },
-    { "id": 1, "tasks": ["1.2", "1.4", "2.1", "2.4"] },
-    { "id": 2, "tasks": ["2.2", "2.3", "2.5"] },
+    { "id": 1, "tasks": ["1.2", "1.4", "2.1"] },
+    { "id": 2, "tasks": ["2.2", "2.3"] },
     { "id": 3, "tasks": ["4.1", "7.6"] },
     { "id": 4, "tasks": ["4.2", "4.3", "4.4"] },
     { "id": 5, "tasks": ["4.5", "4.6", "4.7", "4.8", "4.9", "4.10", "4.11"] },
@@ -373,7 +384,9 @@ Implement the MqCSFramework message queue framework building on the existing ske
     { "id": 13, "tasks": ["10.2", "11.1"] },
     { "id": 14, "tasks": ["11.2"] },
     { "id": 15, "tasks": ["13.1"] },
-    { "id": 16, "tasks": ["13.2", "13.3", "13.4", "13.5", "13.6"] }
+    { "id": 16, "tasks": ["13.2", "13.3", "13.4", "13.5", "13.6"] },
+    { "id": 17, "tasks": ["15.1"] },
+    { "id": 18, "tasks": ["15.2", "15.3"] }
   ]
 }
 ```

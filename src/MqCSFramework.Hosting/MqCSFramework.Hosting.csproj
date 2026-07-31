@@ -14,6 +14,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\MqCSFramework.Abstractions\MqCSFramework.Abstractions.csproj" />
+    <ProjectReference Include="..\MqCSFramework.InMemory\MqCSFramework.InMemory.csproj" />
   </ItemGroup>
 
 </Project>

@@ -184,7 +184,7 @@ sequenceDiagram
 | Connection per sender/consumer | Each sender/consumer gets its own `ITransportConnection` | Enables connecting to multiple brokers from one service, fault isolation per endpoint |
 | Serialization | `IMessageSerializer` interface, default `System.Text.Json` | Pluggable without adding dependencies to abstractions package |
 | RPC response tracking | `ConcurrentDictionary<string, TaskCompletionSource<T>>` keyed by messageId | Proven pattern from reference, lightweight and lock-free |
-| Processor routing | Dual routing: by `mq-processor-type` header (preferred) or by message type name (fallback) | Compile-time safety via `SendAsync<TProcessor>`, backward-compatible with message-type routing |
+| Processor routing | Route by `mq-processor-type` header only (interface full name). No fallback — messages without the header are rejected. | Simple, predictable routing. All messages must be sent via the framework. |
 | Connection lifecycle | Lazy initialization with semaphore, auto-reconnect on failure (per connection) | Matches reference pattern but cleaner with `IAsyncDisposable` |
 | Tracing | Single `ActivitySource("MqCSFramework")` with W3C propagation | Standard .NET/OTel pattern, zero external dependency |
 | Health checks | `IHealthCheck` per sender/consumer connection (keyed) | ASP.NET Core native, reports per-connection status |
@@ -232,87 +232,85 @@ public interface ITransportChannel : IAsyncDisposable
 ```csharp
 /// <summary>
 /// Fire-and-forget message sender. Publishes a message without expecting a response.
+/// The sender always specifies the target processor contract interface for compile-time routing.
 /// </summary>
 public interface IMessageSender
 {
     /// <summary>
-    /// Send a message specifying the target processor type.
-    /// The processor type is added as a header for routing on the consumer side.
-    /// TMessage is inferred from the processor's IMessageProcessor&lt;TMessage&gt; definition.
-    /// TProcessor can be the concrete processor class or a shared contract interface.
+    /// Send a message targeting a specific processor contract interface.
+    /// TProcessor must be a processor contract interface (e.g., IOrderPlacedProcessor : IMessageProcessor&lt;OrderPlaced&gt;).
+    /// The interface's full type name is added as a header for routing on the consumer side.
+    /// TMessage is inferred from the interface's generic parameters.
     /// </summary>
     Task<string> SendAsync<TProcessor>(
         object message,
         SendOptions? options = null,
         CancellationToken ct = default)
         where TProcessor : class;
-
-    /// <summary>
-    /// Send a message without specifying a processor (routes by message type name on consumer side).
-    /// </summary>
-    Task<string> SendAsync<TMessage>(
-        TMessage message,
-        SendOptions? options = null,
-        CancellationToken ct = default) where TMessage : class;
 }
 
 /// <summary>
 /// RPC sender. Publishes a request and awaits a typed response.
+/// The sender always specifies the target processor contract interface for compile-time routing.
 /// </summary>
 public interface IRpcSender
 {
     /// <summary>
-    /// Send an RPC request specifying the target processor type.
-    /// TRequest and TResponse are inferred from the processor's IRpcProcessor&lt;TReq, TRes&gt; definition.
+    /// Send an RPC request targeting a specific processor contract interface.
+    /// TProcessor must be a processor contract interface (e.g., ICheckStockProcessor : IRpcProcessor&lt;CheckStockRequest, CheckStockResponse&gt;).
+    /// TRequest and TResponse are inferred from the interface's generic parameters.
     /// The response type is compile-time enforced — no need to specify it manually.
-    /// TProcessor can be the concrete processor class or a shared contract interface.
     /// </summary>
-    Task<TResponse> SendAsync<TProcessor>(
+    Task<TResponse> SendAsync<TProcessor, TResponse>(
         object request,
         RpcOptions? options = null,
         CancellationToken ct = default)
-        where TProcessor : class;
-
-    /// <summary>
-    /// Send an RPC request without specifying a processor (routes by message type).
-    /// Both TRequest and TResponse must be specified explicitly.
-    /// </summary>
-    Task<TResponse> SendAsync<TRequest, TResponse>(
-        TRequest request,
-        RpcOptions? options = null,
-        CancellationToken ct = default)
-        where TRequest : class
+        where TProcessor : class
         where TResponse : class;
 }
 ```
 
 **Processor-linked routing mechanism:**
 
-When `SendAsync<TProcessor>` is called:
-1. The framework resolves `TMessage` (or `TRequest`/`TResponse`) from the processor's generic interface via reflection (cached at startup)
-2. It validates the message object is assignable to the expected type
-3. It adds the header `mq-processor-type` with the processor type's assembly-qualified name
-4. On the consumer side, the router first checks `mq-processor-type` header — if present, routes directly to the matching processor. Falls back to message-type routing if the header is absent.
+The sender always references a **processor contract interface** (never the concrete implementation). This ensures clean separation between sender and consumer — the sender only needs the shared contracts package.
 
-**Usage patterns:**
+When `SendAsync<TProcessor>` is called:
+1. `TProcessor` must be a processor contract interface (e.g., `IOrderPlacedProcessor : IMessageProcessor<OrderPlaced>`)
+2. The framework resolves `TMessage` (or `TRequest`/`TResponse`) from the interface's generic parameters via cached reflection
+3. It validates the message object is assignable to the expected type
+4. It adds the header `mq-processor-type` with the interface's full type name
+5. On the consumer side, the router matches the `mq-processor-type` header to the registered processor that implements that interface
+
+**Architecture:**
+
+```
+Shared Contracts Package (referenced by sender + consumer):
+├── IOrderPlacedProcessor : IMessageProcessor<OrderPlaced>
+├── ICheckStockProcessor : IRpcProcessor<CheckStockRequest, CheckStockResponse>
+├── OrderPlaced (record)
+├── CheckStockRequest (record)
+└── CheckStockResponse (record)
+
+Sender (references Contracts + MqCSFramework.Abstractions):
+    await sender.SendAsync<IOrderPlacedProcessor>(new OrderPlaced { ... });
+    var stock = await rpcSender.SendAsync<ICheckStockProcessor>(new CheckStockRequest("SKU-001"));
+
+Consumer (references Contracts + MqCSFramework.Abstractions + MqCSFramework.Hosting):
+    public class OrderPlacedProcessor : IOrderPlacedProcessor { ... }
+    public class CheckStockProcessor : ICheckStockProcessor { ... }
+    
+    // Registration:
+    mq.AddProcessor<OrderPlacedProcessor>();  // resolves IOrderPlacedProcessor automatically
+    mq.AddRpcProcessor<CheckStockProcessor>(); // resolves ICheckStockProcessor automatically
+```
+
+**Usage:**
 
 ```csharp
-// Pattern 1: Processor-linked (compile-time safety, inferred types)
-// Sender references the processor type (concrete or interface)
-await sender.SendAsync<OrderPlacedProcessor>(new OrderPlaced { OrderId = "123" });
-var stock = await rpcSender.SendAsync<CheckStockProcessor>(new CheckStockRequest("SKU-001"));
-// ↑ Returns CheckStockResponse because CheckStockProcessor : IRpcProcessor<CheckStockRequest, CheckStockResponse>
-
-// Pattern 2: Shared contract interface (more decoupled)
-// Define in a shared contracts package:
-// public interface IOrderPlacedProcessor : IMessageProcessor<OrderPlaced> { }
-// public interface ICheckStockProcessor : IRpcProcessor<CheckStockRequest, CheckStockResponse> { }
+// Sender side — always uses the contract interface
 await sender.SendAsync<IOrderPlacedProcessor>(new OrderPlaced { OrderId = "123" });
 var stock = await rpcSender.SendAsync<ICheckStockProcessor>(new CheckStockRequest("SKU-001"));
-
-// Pattern 3: Message-type only (no processor reference needed)
-await sender.SendAsync(new OrderPlaced { OrderId = "123" });
-var stock = await rpcSender.SendAsync<CheckStockRequest, CheckStockResponse>(new CheckStockRequest("SKU-001"));
+// ↑ Returns CheckStockResponse — inferred from ICheckStockProcessor's generic args
 ```
 
 #### Processor Interfaces
@@ -695,21 +693,6 @@ public sealed class MqCSFrameworkBuilder
     public MqCSFrameworkBuilder AddInMemoryConsumer(string name, string queueName);
 
     /// <summary>
-    /// Register a message processor. Automatically maps TMessage type name for routing.
-    /// </summary>
-    public MqCSFrameworkBuilder AddProcessor<TProcessor, TMessage>()
-        where TProcessor : class, IMessageProcessor<TMessage>
-        where TMessage : class;
-
-    /// <summary>
-    /// Register an RPC processor.
-    /// </summary>
-    public MqCSFrameworkBuilder AddRpcProcessor<TProcessor, TRequest, TResponse>()
-        where TProcessor : class, IRpcProcessor<TRequest, TResponse>
-        where TRequest : class
-        where TResponse : class;
-
-    /// <summary>
     /// Add health checks for all registered sender/consumer connections.
     /// Each connection is reported independently.
     /// </summary>
@@ -769,21 +752,26 @@ public class OrderService(
 // Program.cs — Consumer service
 var builder = Host.CreateApplicationBuilder(args);
 
+// Register processors as standard DI singletons — no special builder method needed
+builder.Services.AddSingleton<IOrderPlacedProcessor, OrderPlacedProcessor>();
+
 builder.Services.AddMqCSFramework(mq =>
 {
     mq.AddConsumer("orders", opts =>
     {
         builder.Configuration.GetSection("MqCSFramework:Consumers:orders").Bind(opts);
     });
-    mq.AddProcessor<OrderPlacedProcessor, OrderPlaced>();
     mq.AddHealthChecks();
 });
 
 var app = builder.Build();
 await app.RunAsync();
 
-// Processor implementation:
-public class OrderPlacedProcessor : IMessageProcessor<OrderPlaced>
+// Contract interface (in shared contracts package):
+public interface IOrderPlacedProcessor : IMessageProcessor<OrderPlaced> { }
+
+// Processor implementation (in consumer project):
+public class OrderPlacedProcessor : IOrderPlacedProcessor
 {
     public async Task ProcessAsync(OrderPlaced message, MessageContext context, CancellationToken ct)
     {
@@ -795,34 +783,38 @@ public class OrderPlacedProcessor : IMessageProcessor<OrderPlaced>
 
 ### Internal Components
 
-#### ProcessorRouter
+#### MessageDispatcher
 
-Routes incoming messages to the correct processor. Uses a dual-lookup strategy:
-1. **Primary:** Check `mq-processor-type` header → direct lookup by processor type name
-2. **Fallback:** Check `MessageType` header → lookup by message type name (for messages sent without `SendAsync<TProcessor>`)
+Resolves the processor from DI and dispatches the message. Replaces ProcessorRouter, ProcessorRegistration, and ProcessorTypeResolver.
 
 ```csharp
-internal sealed class ProcessorRouter
+internal sealed class MessageDispatcher
 {
-    // Primary routing: processor type name → registration
-    private readonly Dictionary<string, ProcessorRegistration> _byProcessorType;
-    // Fallback routing: message type name → registration
-    private readonly Dictionary<string, ProcessorRegistration> _byMessageType;
-    private readonly Dictionary<string, RpcProcessorRegistration> _rpcByProcessorType;
-    private readonly Dictionary<string, RpcProcessorRegistration> _rpcByMessageType;
     private readonly IServiceProvider _serviceProvider;
-    private readonly ILogger<ProcessorRouter> _logger;
+    private readonly IMessageSerializer _serializer;
+    private readonly ILogger<MessageDispatcher> _logger;
 
-    public async Task<ProcessResult> RouteStandardAsync(
-        ReceivedMessage message, CancellationToken ct);
+    // Cache: processor interface Type → TMessage type (resolved once from generic args)
+    private readonly ConcurrentDictionary<Type, Type> _messageTypeCache = new();
+    // Cache: processor interface Type → TResponse type (for RPC, resolved once)
+    private readonly ConcurrentDictionary<Type, Type> _responseTypeCache = new();
 
-    public async Task<(ProcessResult result, byte[]? response)> RouteRpcAsync(
-        ReceivedMessage message, CancellationToken ct);
+    public async Task<ProcessResult> DispatchStandardAsync(ReceivedMessage message, CancellationToken ct);
+    public async Task<(ProcessResult result, byte[]? response)> DispatchRpcAsync(ReceivedMessage message, CancellationToken ct);
 }
-
-internal record ProcessorRegistration(Type ProcessorType, Type MessageType);
-internal record RpcProcessorRegistration(Type ProcessorType, Type RequestType, Type ResponseType);
 ```
+
+**Dispatch flow:**
+1. Read `mq-processor-type` header → `Type.GetType(headerValue)` to get the processor interface type
+2. If null or header missing → NACK, throw `UnknownMessageTypeException`
+3. Resolve the processor from DI: `serviceProvider.GetService(processorInterfaceType)`
+4. If null → NACK (processor not registered)
+5. Get `TMessage` from the interface's generic args (cached in `_messageTypeCache`)
+6. Deserialize message body to `TMessage` using `IMessageSerializer`
+7. Call `ProcessAsync(message, context, ct)` via reflection-free invocation (cast to the known interface)
+8. For RPC: serialize the response and return the bytes
+
+No startup registration, no dictionaries, no `ProcessorRegistration` records. Just DI + one type cache.
 
 #### MessageMasker
 
@@ -1089,7 +1081,7 @@ public static class MessageHeaders
 
 ### Property 2: Message Routing Correctness
 
-*For any* set of N registered processors (each handling a distinct message type), and any message with a `mq-processor-type` header matching one of those registrations, the consumer SHALL invoke exactly the processor identified by that header. If the `mq-processor-type` header is absent, routing SHALL fall back to the `MessageType` header. No other processors SHALL be invoked.
+*For any* set of N registered processors (each handling a distinct message type), and any message with a `mq-processor-type` header matching one of those registrations, the consumer SHALL invoke exactly the processor identified by that header. Messages without the `mq-processor-type` header SHALL be rejected (NACK'd). No other processors SHALL be invoked.
 
 **Validates: Requirements 2.5, 5.3, 8.2, 8.4**
 

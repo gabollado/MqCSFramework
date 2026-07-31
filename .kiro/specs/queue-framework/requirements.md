@@ -95,7 +95,7 @@ An open-source, lightweight message queue framework for .NET 10 that provides a 
 
 1. Extension methods register all required services
 2. Senders are injectable via interfaces
-3. Consumer processors are registered via DI and resolved per message
+3. Processors are registered as standard DI singletons (e.g., `services.AddSingleton<IMyProcessor, MyProcessorImpl>()`) — the framework resolves them at runtime from the DI container using the processor interface type from the message header
 4. Configuration is bound from IConfiguration (appsettings.json sections)
 5. Multiple sender/consumer configurations can coexist (named/keyed instances)
 
@@ -131,10 +131,10 @@ An open-source, lightweight message queue framework for .NET 10 that provides a 
 2. The consumer dispatches to the matching processor
 3. Unknown message types are logged and NACK'd (not silently dropped)
 4. Multiple processors can be registered for different message types on the same queue
-5. Senders can specify the target processor type as a generic parameter, creating a compile-time link between sender and consumer
-6. The processor type is propagated as a message header for routing on the consumer side
-7. Both concrete processor types and shared contract interfaces are supported as the generic parameter
-8. Fallback routing by message type name is supported for messages sent without a processor type reference
+5. Senders specify the target processor contract interface as a generic parameter, creating a compile-time link between sender and consumer
+6. The processor interface's full type name is propagated as a message header for routing on the consumer side
+7. The sender project references only the shared contracts package containing the processor interface — never the concrete implementation
+8. Messages without a `mq-processor-type` header are rejected (NACK'd) — all messages must target a specific processor
 
 ### Requirement 9: Logging and Observability
 
