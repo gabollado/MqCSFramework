@@ -2,323 +2,102 @@
 
 ## Overview
 
-MqCSFramework is a lightweight, broker-agnostic message queue framework for .NET 10. It provides a clean abstraction layer over message brokers with two transport implementations (RabbitMQ, In-Memory) and two messaging patterns (Standard fire-and-forget, RPC request-reply).
+MqCSFramework is a single-package, RabbitMQ-only messaging framework for .NET 10. It provides compile-time type-safe sending via processor contract interfaces, automatic consumer dispatch using DI resolution from message headers, and independent connection management per sender/consumer.
 
-The design prioritizes simplicity over the reference implementation by:
-- Introducing a **transport abstraction layer** that doesn't exist in the current codebase
-- Using **keyed DI services** instead of manual ConcurrentDictionary-based singleton factories
-- **Independent connections per sender/consumer** — each has its own connection options, enabling a single service to connect to multiple RabbitMQ instances simultaneously
-- Reducing the type count through generic interfaces with clear responsibilities
-- Following modern .NET patterns: async-first, nullable, `IAsyncDisposable`, `ActivitySource`
+The framework supports two messaging patterns:
+- **Standard** (fire-and-forget): publish a message, no response expected
+- **RPC** (request-reply): publish a request, await a typed response
 
-### Package Dependency Graph
+The key design principle is **simplicity**: one NuGet package, no transport abstraction, no routing tables, no processor registration at the consumer. The consumer resolves processors purely from the `mq-processor-type` header at runtime.
 
-```
-MqCSFramework.Hosting ──► MqCSFramework.Abstractions
-MqCSFramework.RabbitMQ ──► MqCSFramework.Abstractions
-MqCSFramework.InMemory ──► MqCSFramework.Abstractions
-```
+### Design Goals
 
-- `MqCSFramework.Abstractions` has zero third-party dependencies (only `Microsoft.Extensions.*` contracts)
-- `MqCSFramework.RabbitMQ` depends on `RabbitMQ.Client` (v7.x)
-- `MqCSFramework.InMemory` has no external dependencies
-- `MqCSFramework.Hosting` depends on `Microsoft.Extensions.Hosting`
+1. Compile-time safety — the sender cannot send a message type that doesn't match the processor's expectation
+2. Zero consumer configuration for processors — register in DI, the consumer auto-discovers via headers
+3. Independent connections — each sender/consumer manages its own connection lifecycle
+4. Minimal API surface — two sender interfaces, two processor base interfaces, one builder
 
+### Dependencies
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| RabbitMQ.Client | 7.x | Broker communication (fully async API) |
+| Microsoft.Extensions.Hosting | 10.x | BackgroundService, DI integration |
+| Microsoft.Extensions.DependencyInjection | 10.x | Keyed services, service resolution |
+| System.Text.Json | 10.x | Message serialization |
+| Microsoft.Extensions.Logging | 10.x | Structured logging |
 
 ## Architecture
 
-### High-Level System Diagram
-
 ```mermaid
 graph TB
-    subgraph Application Code
-        App[Application Service]
+    subgraph "Shared Contracts Package"
+        IOP[IOrderProcessor : IMessageProcessor&lt;OrderMessage&gt;]
+        ISP[IStockProcessor : IRpcProcessor&lt;StockReq, StockRes&gt;]
     end
 
-    subgraph MqCSFramework.Hosting
-        DI[DI Extensions / Builder]
-        BG[ConsumerHostedService]
-        HC[Health Checks - per connection]
+    subgraph "Sender Service"
+        SS[IStandardSender]
+        RS[IRpcSender]
+        SC[SenderConnection]
     end
 
-    subgraph MqCSFramework.Abstractions
-        IS[IMessageSender / IRpcSender]
-        IC[IMessageConsumer]
-        IP[IMessageProcessor]
-        SER[IMessageSerializer]
-        TR[ITransportConnection - per sender/consumer]
-        MD[Message Models]
-        OBS[ActivitySource / Tracing]
+    subgraph "RabbitMQ Broker"
+        EX[Exchange]
+        Q[Queue]
+        RQ[Reply Queue]
     end
 
-    subgraph MqCSFramework.RabbitMQ
-        RTS1[RabbitMqTransportConnection - Sender A]
-        RTS2[RabbitMqTransportConnection - Consumer B]
-        RSS[RabbitMqStandardSender]
-        RRS[RabbitMqRpcSender]
-        RMC[RabbitMqConsumer]
+    subgraph "Consumer Service"
+        CH[ConsumerHostedService]
+        MC[MqConsumer]
+        DI[ServiceProvider]
+        OP[OrderProcessor]
+        SP[StockProcessor]
     end
 
-    subgraph MqCSFramework.InMemory
-        ITS[InMemoryTransportConnection]
-        ISS[InMemoryStandardSender]
-        IRS[InMemoryRpcSender]
-        IMC[InMemoryConsumer]
-    end
-
-    App --> IS
-    App --> IP
-    DI --> IS
-    DI --> IC
-    BG --> IC
-    HC --> TR
-
-    IS -.-> RSS
-    IS -.-> ISS
-    IC -.-> RMC
-    IC -.-> IMC
-    RSS --> RTS1
-    RMC --> RTS2
-    TR -.-> RTS1
-    TR -.-> RTS2
-    TR -.-> ITS
+    SS -->|SendAsync&lt;IOrderProcessor&gt;| SC
+    RS -->|SendAsync&lt;IStockProcessor, StockRes&gt;| SC
+    SC -->|publish with headers| EX
+    EX --> Q
+    Q --> MC
+    MC -->|read mq-processor-type header| DI
+    DI -->|resolve by interface type| OP
+    DI -->|resolve by interface type| SP
+    MC -->|RPC response| RQ
+    RQ --> RS
 ```
 
-### Connection Model
+### Message Flow — Standard Pattern
 
-Each sender and consumer owns its own `ITransportConnection` instance. There is **no shared global connection**. This architecture enables:
+1. Sender calls `IStandardSender.SendAsync<TProcessor, TMessage>(message)`
+2. Framework serializes message to JSON
+3. Framework sets headers: `mq-processor-type` = `typeof(TProcessor).AssemblyQualifiedName`, `mq-pattern` = `"standard"`
+4. Framework publishes to configured exchange/routing key via RabbitMQ.Client 7.x
+5. Consumer receives message, reads `mq-processor-type` header
+6. Consumer calls `Type.GetType(headerValue)` → resolves from DI → calls `ProcessAsync`
+7. On success: ACK. On failure: NACK (with requeue/dead-letter based on retry config)
 
-- A single service to connect to **multiple RabbitMQ instances** (different hosts, credentials, virtual hosts)
-- Independent connection lifecycle per sender/consumer — one failing connection does not affect others
-- Per-connection health reporting
-- Isolated reconnection behavior — one sender reconnecting does not disrupt other senders or consumers
+### Message Flow — RPC Pattern
 
-```mermaid
-graph LR
-    subgraph Service Host
-        S1[Sender: orders]
-        S2[RpcSender: inventory]
-        C1[Consumer: payments]
-    end
-
-    subgraph Connections
-        CN1[Connection 1 - rabbit-cluster-a]
-        CN2[Connection 2 - rabbit-cluster-b]
-        CN3[Connection 3 - rabbit-cluster-a]
-    end
-
-    subgraph Brokers
-        B1[RabbitMQ Cluster A]
-        B2[RabbitMQ Cluster B]
-    end
-
-    S1 --> CN1
-    S2 --> CN2
-    C1 --> CN3
-    CN1 --> B1
-    CN2 --> B2
-    CN3 --> B1
-```
-
-### Message Flow: Standard (Fire-and-Forget)
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Sender as IMessageSender
-    participant Serializer as IMessageSerializer
-    participant Transport as Transport Layer
-    participant Broker as Message Broker
-    participant Consumer as IMessageConsumer
-    participant Router as Processor Router
-    participant Processor as IMessageProcessor<T>
-
-    App->>Sender: SendAsync<TProcessor>(message)
-    Sender->>Sender: Resolve TMessage from TProcessor generic args
-    Sender->>Sender: Add header: mq-processor-type = typeof(TProcessor)
-    Sender->>Serializer: Serialize(message)
-    Sender->>Transport: PublishAsync(envelope)
-    Transport->>Broker: Deliver message
-    Broker->>Consumer: Deliver message
-    Consumer->>Router: Route by mq-processor-type header (or fallback: message type)
-    Router->>Processor: ProcessAsync(message, context)
-    Processor-->>Consumer: Success/Failure
-    Consumer->>Transport: ACK or NACK
-```
-
-### Message Flow: RPC (Request-Reply)
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Sender as IRpcSender
-    participant PendingMap as PendingRequests (ConcurrentDictionary)
-    participant Transport as Transport Layer
-    participant Broker as Message Broker
-    participant Consumer as IMessageConsumer
-    participant Processor as IRpcProcessor<TReq,TRes>
-
-    App->>Sender: SendAsync<TProcessor>(request)
-    Sender->>Sender: Resolve TReq, TRes from TProcessor generic args
-    Sender->>Sender: Add header: mq-processor-type = typeof(TProcessor)
-    Sender->>PendingMap: Register TaskCompletionSource (messageId)
-    Sender->>Transport: PublishAsync(envelope + replyTo)
-    Transport->>Broker: Deliver request
-    Broker->>Consumer: Deliver request
-    Consumer->>Router: Route by mq-processor-type header
-    Router->>Processor: ProcessAsync(request, context)
-    Processor-->>Consumer: TResponse
-    Consumer->>Broker: Publish response to replyTo
-    Broker->>Sender: Deliver response
-    Sender->>PendingMap: Complete TCS with response
-    PendingMap-->>App: Return TResponse
-```
-
-
-### Design Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Transport abstraction | Interface-based (`ITransportConnection`, `ITransportChannel`) | Enables broker swapping via DI without code changes |
-| Named sender/consumer instances | .NET 8+ keyed services (`[FromKeyedServices]`) | Eliminates manual ConcurrentDictionary factories from reference impl |
-| Connection per sender/consumer | Each sender/consumer gets its own `ITransportConnection` | Enables connecting to multiple brokers from one service, fault isolation per endpoint |
-| Serialization | `IMessageSerializer` interface, default `System.Text.Json` | Pluggable without adding dependencies to abstractions package |
-| RPC response tracking | `ConcurrentDictionary<string, TaskCompletionSource<T>>` keyed by messageId | Proven pattern from reference, lightweight and lock-free |
-| Processor routing | Route by `mq-processor-type` header only (interface full name). No fallback — messages without the header are rejected. | Simple, predictable routing. All messages must be sent via the framework. |
-| Connection lifecycle | Lazy initialization with semaphore, auto-reconnect on failure (per connection) | Matches reference pattern but cleaner with `IAsyncDisposable` |
-| Tracing | Single `ActivitySource("MqCSFramework")` with W3C propagation | Standard .NET/OTel pattern, zero external dependency |
-| Health checks | `IHealthCheck` per sender/consumer connection (keyed) | ASP.NET Core native, reports per-connection status |
-| Consumer hosting | One `BackgroundService` managing multiple consumer instances | Simplification of reference's `IRabbitMQConsumerStarter` pattern |
+1. Sender calls `IRpcSender.SendAsync<TProcessor, TResponse, TRequest>(request)`
+2. Framework creates a temporary reply queue (or uses Direct Reply-to)
+3. Framework sets headers: `mq-processor-type`, `mq-pattern` = `"rpc"`, plus `ReplyTo` and `CorrelationId`
+4. Consumer receives, resolves processor, calls `ProcessAsync` which returns `TResponse`
+5. Consumer serializes response and publishes to the reply queue
+6. Sender awaits response with timeout → returns `TResponse` or throws `RpcTimeoutException`
+7. If processor throws, consumer wraps error and publishes error response → sender throws `RpcRemoteException`
 
 ## Components and Interfaces
 
-### Package: MqCSFramework.Abstractions
-
-This package contains all public contracts. Application code references only this package.
-
-#### Core Transport Interfaces
+### Processor Contracts (Shared between sender and consumer)
 
 ```csharp
-namespace MqCSFramework.Abstractions;
+namespace MqCSFramework;
 
 /// <summary>
-/// Represents a connection to a message broker. Manages connection lifecycle.
-/// One instance per sender or consumer — NOT shared globally.
-/// </summary>
-public interface ITransportConnection : IAsyncDisposable
-{
-    string Name { get; }
-    bool IsConnected { get; }
-    Task ConnectAsync(CancellationToken ct = default);
-    Task<ITransportChannel> CreateChannelAsync(CancellationToken ct = default);
-    event Func<Exception, Task>? ConnectionLost;
-    event Func<Task>? ConnectionRecovered;
-}
-
-/// <summary>
-/// A channel over a transport connection. Handles publish/consume operations.
-/// </summary>
-public interface ITransportChannel : IAsyncDisposable
-{
-    Task PublishAsync(MessageEnvelope envelope, CancellationToken ct = default);
-    Task StartConsumingAsync(string queueName, Func<ReceivedMessage, Task<ProcessResult>> handler, CancellationToken ct = default);
-    Task AcknowledgeAsync(ulong deliveryTag, CancellationToken ct = default);
-    Task NegativeAcknowledgeAsync(ulong deliveryTag, bool requeue, CancellationToken ct = default);
-}
-```
-
-#### Sender Interfaces
-
-```csharp
-/// <summary>
-/// Fire-and-forget message sender. Publishes a message without expecting a response.
-/// The sender always specifies the target processor contract interface for compile-time routing.
-/// </summary>
-public interface IMessageSender
-{
-    /// <summary>
-    /// Send a message targeting a specific processor contract interface.
-    /// TProcessor must be a processor contract interface (e.g., IOrderPlacedProcessor : IMessageProcessor&lt;OrderPlaced&gt;).
-    /// The interface's full type name is added as a header for routing on the consumer side.
-    /// TMessage is inferred from the interface's generic parameters.
-    /// </summary>
-    Task<string> SendAsync<TProcessor>(
-        object message,
-        SendOptions? options = null,
-        CancellationToken ct = default)
-        where TProcessor : class;
-}
-
-/// <summary>
-/// RPC sender. Publishes a request and awaits a typed response.
-/// The sender always specifies the target processor contract interface for compile-time routing.
-/// </summary>
-public interface IRpcSender
-{
-    /// <summary>
-    /// Send an RPC request targeting a specific processor contract interface.
-    /// TProcessor must be a processor contract interface (e.g., ICheckStockProcessor : IRpcProcessor&lt;CheckStockRequest, CheckStockResponse&gt;).
-    /// TRequest and TResponse are inferred from the interface's generic parameters.
-    /// The response type is compile-time enforced — no need to specify it manually.
-    /// </summary>
-    Task<TResponse> SendAsync<TProcessor, TResponse>(
-        object request,
-        RpcOptions? options = null,
-        CancellationToken ct = default)
-        where TProcessor : class
-        where TResponse : class;
-}
-```
-
-**Processor-linked routing mechanism:**
-
-The sender always references a **processor contract interface** (never the concrete implementation). This ensures clean separation between sender and consumer — the sender only needs the shared contracts package.
-
-When `SendAsync<TProcessor>` is called:
-1. `TProcessor` must be a processor contract interface (e.g., `IOrderPlacedProcessor : IMessageProcessor<OrderPlaced>`)
-2. The framework resolves `TMessage` (or `TRequest`/`TResponse`) from the interface's generic parameters via cached reflection
-3. It validates the message object is assignable to the expected type
-4. It adds the header `mq-processor-type` with the interface's full type name
-5. On the consumer side, the router matches the `mq-processor-type` header to the registered processor that implements that interface
-
-**Architecture:**
-
-```
-Shared Contracts Package (referenced by sender + consumer):
-├── IOrderPlacedProcessor : IMessageProcessor<OrderPlaced>
-├── ICheckStockProcessor : IRpcProcessor<CheckStockRequest, CheckStockResponse>
-├── OrderPlaced (record)
-├── CheckStockRequest (record)
-└── CheckStockResponse (record)
-
-Sender (references Contracts + MqCSFramework.Abstractions):
-    await sender.SendAsync<IOrderPlacedProcessor>(new OrderPlaced { ... });
-    var stock = await rpcSender.SendAsync<ICheckStockProcessor>(new CheckStockRequest("SKU-001"));
-
-Consumer (references Contracts + MqCSFramework.Abstractions + MqCSFramework.Hosting):
-    public class OrderPlacedProcessor : IOrderPlacedProcessor { ... }
-    public class CheckStockProcessor : ICheckStockProcessor { ... }
-    
-    // Registration:
-    mq.AddProcessor<OrderPlacedProcessor>();  // resolves IOrderPlacedProcessor automatically
-    mq.AddRpcProcessor<CheckStockProcessor>(); // resolves ICheckStockProcessor automatically
-```
-
-**Usage:**
-
-```csharp
-// Sender side — always uses the contract interface
-await sender.SendAsync<IOrderPlacedProcessor>(new OrderPlaced { OrderId = "123" });
-var stock = await rpcSender.SendAsync<ICheckStockProcessor>(new CheckStockRequest("SKU-001"));
-// ↑ Returns CheckStockResponse — inferred from ICheckStockProcessor's generic args
-```
-
-#### Processor Interfaces
-
-```csharp
-/// <summary>
-/// Processes a standard (fire-and-forget) message of type TMessage.
-/// Implement this interface and register via DI.
+/// Base interface for standard message processors.
+/// Implement this in a contract interface shared between sender and consumer.
 /// </summary>
 public interface IMessageProcessor<in TMessage> where TMessage : class
 {
@@ -326,629 +105,879 @@ public interface IMessageProcessor<in TMessage> where TMessage : class
 }
 
 /// <summary>
-/// Processes an RPC request of type TRequest and returns TResponse.
+/// Base interface for RPC processors that return a response.
+/// Implement this in a contract interface shared between sender and consumer.
 /// </summary>
-public interface IRpcProcessor<in TRequest, TResponse>
-    where TRequest : class
-    where TResponse : class
+public interface IRpcProcessor<in TRequest, TResponse> where TRequest : class where TResponse : class
 {
     Task<TResponse> ProcessAsync(TRequest request, MessageContext context, CancellationToken ct = default);
 }
 ```
 
-
-#### Serialization Interface
+### Sender Interfaces
 
 ```csharp
+namespace MqCSFramework;
+
 /// <summary>
-/// Pluggable message serialization. Default implementation uses System.Text.Json.
+/// Sends standard (fire-and-forget) messages.
+/// The TProcessor generic constraint enforces compile-time type safety.
 /// </summary>
-public interface IMessageSerializer
+public interface IStandardSender
 {
-    byte[] Serialize<T>(T message) where T : class;
-    T Deserialize<T>(ReadOnlySpan<byte> data) where T : class;
-    object Deserialize(ReadOnlySpan<byte> data, Type type);
-    string ContentType { get; } // e.g. "application/json"
+    Task<string> SendAsync<TProcessor, TMessage>(
+        TMessage message,
+        SendOptions? options = null,
+        CancellationToken ct = default)
+        where TProcessor : IMessageProcessor<TMessage>
+        where TMessage : class;
+}
+
+/// <summary>
+/// Sends RPC (request-reply) messages and awaits a typed response.
+/// </summary>
+public interface IRpcSender
+{
+    Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(
+        TRequest request,
+        RpcOptions? options = null,
+        CancellationToken ct = default)
+        where TProcessor : IRpcProcessor<TRequest, TResponse>
+        where TRequest : class
+        where TResponse : class;
 }
 ```
 
-#### Consumer Interface
+### Message Context
 
 ```csharp
-/// <summary>
-/// Represents a message consumer that listens on a queue and dispatches to processors.
-/// Managed by the hosting layer's BackgroundService.
-/// </summary>
-public interface IMessageConsumer : IAsyncDisposable
-{
-    string QueueName { get; }
-    Task StartAsync(CancellationToken ct = default);
-    Task StopAsync(CancellationToken ct = default);
-    bool IsRunning { get; }
-}
-```
-
-#### Configuration Options
-
-```csharp
-/// <summary>
-/// Options for sending a standard message.
-/// </summary>
-public record SendOptions
-{
-    public string? Exchange { get; init; }
-    public string? RoutingKey { get; init; }
-    public string? CorrelationId { get; init; }
-    public string? SenderIdentity { get; init; }
-    public bool Persistent { get; init; } = true;
-    public IDictionary<string, object?>? Headers { get; init; }
-}
+namespace MqCSFramework;
 
 /// <summary>
-/// Options for sending an RPC request.
-/// </summary>
-public record RpcOptions
-{
-    public string? RoutingKey { get; init; }
-    public string? CorrelationId { get; init; }
-    public string? SenderIdentity { get; init; }
-    public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(30);
-    public IDictionary<string, object?>? Headers { get; init; }
-}
-```
-
-
-### Package: MqCSFramework.RabbitMQ
-
-Implements all transport interfaces using `RabbitMQ.Client` v7.x (fully async API).
-
-#### Key Classes
-
-```csharp
-namespace MqCSFramework.RabbitMQ;
-
-/// <summary>
-/// RabbitMQ implementation of ITransportConnection.
-/// Manages a single AMQP connection with auto-reconnect.
-/// Each sender/consumer gets its own instance — connections are NOT shared.
-/// </summary>
-public sealed class RabbitMqTransportConnection : ITransportConnection
-{
-    private IConnection? _connection;
-    private readonly ConnectionFactory _factory;
-    private readonly RabbitMqConnectionOptions _options;
-    private readonly ILogger<RabbitMqTransportConnection> _logger;
-    private readonly SemaphoreSlim _connectLock = new(1, 1);
-
-    public string Name { get; }
-
-    // Lazy-init with semaphore, reconnect on ConnectionLost event
-    // Name is set from the sender/consumer registration name (e.g. "orders", "inventory")
-}
-
-/// <summary>
-/// RabbitMQ channel wrapper implementing ITransportChannel.
-/// </summary>
-public sealed class RabbitMqTransportChannel : ITransportChannel
-{
-    private readonly IChannel _channel;
-    private readonly RabbitMqChannelOptions _options;
-    // Wraps RabbitMQ.Client.IChannel operations
-}
-
-/// <summary>
-/// Standard sender using RabbitMQ transport.
-/// Owns its own ITransportConnection instance.
-/// </summary>
-public sealed class RabbitMqStandardSender : IMessageSender, IAsyncDisposable
-{
-    private readonly ITransportConnection _connection; // dedicated connection for this sender
-    private readonly IMessageSerializer _serializer;
-    private readonly RabbitMqSenderOptions _options;
-    private readonly ActivitySource _activitySource;
-    private ITransportChannel? _channel;
-    // Lazy channel init, reset-on-failure pattern from reference
-}
-
-/// <summary>
-/// RPC sender using RabbitMQ transport.
-/// Owns its own ITransportConnection instance.
-/// Manages a reply queue and pending request dictionary.
-/// </summary>
-public sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
-{
-    private readonly ITransportConnection _connection; // dedicated connection for this sender
-    private readonly IMessageSerializer _serializer;
-    private readonly RabbitMqRpcSenderOptions _options;
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<byte[]>> _pendingRequests = new();
-    private readonly ActivitySource _activitySource;
-    private ITransportChannel? _channel;
-    private string? _replyQueueName;
-    // Same pattern as reference RPCResponseManager but inline
-}
-
-/// <summary>
-/// RabbitMQ consumer that listens on a queue and routes to processors.
-/// Owns its own ITransportConnection instance.
-/// </summary>
-public sealed class RabbitMqConsumer : IMessageConsumer
-{
-    private readonly ITransportConnection _connection; // dedicated connection for this consumer
-    private readonly IMessageSerializer _serializer;
-    private readonly ProcessorRouter _router;
-    private readonly RabbitMqConsumerOptions _options;
-    private readonly ActivitySource _activitySource;
-    private ITransportChannel? _channel;
-    // Message dispatch: deserialize → route by Type header → invoke processor → ACK/NACK
-}
-```
-
-#### RabbitMQ Configuration
-
-```csharp
-/// <summary>
-/// Connection options that are embedded in each sender/consumer configuration.
-/// There is NO global shared connection — each sender/consumer carries its own.
-/// </summary>
-public sealed class RabbitMqConnectionOptions
-{
-    public string HostNames { get; set; } = "localhost";
-    public string UserName { get; set; } = "guest";
-    public string Password { get; set; } = "guest";
-    public string VirtualHost { get; set; } = "/";
-    public string? SslServerName { get; set; }
-    public bool AutomaticRecoveryEnabled { get; set; } = true;
-    public TimeSpan NetworkRecoveryInterval { get; set; } = TimeSpan.FromSeconds(5);
-}
-
-public sealed class RabbitMqSenderOptions
-{
-    /// <summary>
-    /// Connection properties for this specific sender.
-    /// Each sender connects independently.
-    /// </summary>
-    public RabbitMqConnectionOptions Connection { get; set; } = new();
-
-    public string? Exchange { get; set; }
-    public string RoutingKey { get; set; } = "";
-    public bool ConfirmSelect { get; set; } = true;
-    public IList<string>? MaskedFields { get; set; }
-    public LogLevel MessageLogLevel { get; set; } = LogLevel.Information;
-    public bool LogMessageBody { get; set; } = true;
-}
-
-public sealed class RabbitMqRpcSenderOptions
-{
-    /// <summary>
-    /// Connection properties for this specific RPC sender.
-    /// Each RPC sender connects independently.
-    /// </summary>
-    public RabbitMqConnectionOptions Connection { get; set; } = new();
-
-    public string? Exchange { get; set; }
-    public string RoutingKey { get; set; } = "";
-    public bool ConfirmSelect { get; set; } = true;
-    public IList<string>? MaskedFields { get; set; }
-    public LogLevel MessageLogLevel { get; set; } = LogLevel.Information;
-    public bool LogMessageBody { get; set; } = true;
-    public TimeSpan DefaultTimeout { get; set; } = TimeSpan.FromSeconds(30);
-    public int MaxRetryAttempts { get; set; } = 3;
-}
-
-public sealed class RabbitMqConsumerOptions
-{
-    /// <summary>
-    /// Connection properties for this specific consumer.
-    /// Each consumer connects independently.
-    /// </summary>
-    public RabbitMqConnectionOptions Connection { get; set; } = new();
-
-    public string QueueName { get; set; } = "";
-    public ushort PrefetchCount { get; set; } = 10;
-    public bool AutoAck { get; set; } = false;
-    public bool IsRpc { get; set; } = false;
-    public int ProcessingTimeoutMs { get; set; } = 30000;
-    public int DelayRetryLimit { get; set; } = 0;
-    public string? ErrorQueueName { get; set; }
-    public IList<string>? MaskedFields { get; set; }
-    public LogLevel MessageLogLevel { get; set; } = LogLevel.Information;
-    public bool LogMessageBody { get; set; } = true;
-}
-```
-
-
-### Package: MqCSFramework.InMemory
-
-In-process transport for testing and local development. No network calls, no broker required.
-
-```csharp
-namespace MqCSFramework.InMemory;
-
-/// <summary>
-/// In-memory transport connection. Routes messages through Channel<T> queues.
-/// </summary>
-public sealed class InMemoryTransportConnection : ITransportConnection
-{
-    private readonly ConcurrentDictionary<string, Channel<MessageEnvelope>> _queues = new();
-    // Always "connected", creates InMemoryTransportChannel instances
-}
-
-/// <summary>
-/// In-memory channel. Publish writes to a Channel<T>, consume reads from it.
-/// </summary>
-public sealed class InMemoryTransportChannel : ITransportChannel
-{
-    // Publish → write to named Channel<T>
-    // Consume → read loop from named Channel<T>
-}
-
-/// <summary>
-/// In-memory standard sender. Direct dispatch through in-process channels.
-/// </summary>
-public sealed class InMemoryStandardSender : IMessageSender { }
-
-/// <summary>
-/// In-memory RPC sender. Uses TaskCompletionSource for response correlation.
-/// </summary>
-public sealed class InMemoryRpcSender : IRpcSender { }
-
-/// <summary>
-/// In-memory consumer. Reads from a Channel<T> and dispatches to processors.
-/// </summary>
-public sealed class InMemoryConsumer : IMessageConsumer { }
-```
-
-### Package: MqCSFramework.Hosting
-
-Provides the Generic Host integration: DI registration, BackgroundService, health checks.
-
-```csharp
-namespace MqCSFramework.Hosting;
-
-/// <summary>
-/// BackgroundService that manages consumer lifecycle.
-/// Reads consumer configurations and starts/stops IMessageConsumer instances.
-/// </summary>
-public sealed class ConsumerHostedService : BackgroundService
-{
-    private readonly IEnumerable<IMessageConsumer> _consumers;
-    private readonly ILogger<ConsumerHostedService> _logger;
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        // Start all registered consumers
-        // On cancellation: graceful stop with timeout
-    }
-}
-
-/// <summary>
-/// Health check for a specific sender/consumer transport connection.
-/// One health check instance per registered sender/consumer.
-/// </summary>
-public sealed class TransportHealthCheck : IHealthCheck
-{
-    private readonly ITransportConnection _connection;
-
-    public async Task<HealthCheckResult> CheckHealthAsync(
-        HealthCheckContext context, CancellationToken ct = default)
-    {
-        // Connected → Healthy
-        // Recovering → Degraded
-        // Disconnected → Unhealthy
-        // Tags include the connection name for per-endpoint reporting
-    }
-}
-```
-
-#### DI Extension Methods (Builder Pattern)
-
-```csharp
-namespace MqCSFramework.Hosting;
-
-public static class ServiceCollectionExtensions
-{
-    /// <summary>
-    /// Adds MqCSFramework services.
-    /// </summary>
-    public static IServiceCollection AddMqCSFramework(
-        this IServiceCollection services,
-        Action<MqCSFrameworkBuilder> configure)
-    {
-        var builder = new MqCSFrameworkBuilder(services);
-        configure(builder);
-        return services;
-    }
-}
-
-public sealed class MqCSFrameworkBuilder
-{
-    public IServiceCollection Services { get; }
-
-    /// <summary>
-    /// Register a standard sender as a keyed service.
-    /// Each sender has its own connection options — no shared global connection.
-    /// </summary>
-    public MqCSFrameworkBuilder AddSender(string name, Action<RabbitMqSenderOptions> configure);
-
-    /// <summary>
-    /// Register an RPC sender as a keyed service.
-    /// Each RPC sender has its own connection options — no shared global connection.
-    /// </summary>
-    public MqCSFrameworkBuilder AddRpcSender(string name, Action<RabbitMqRpcSenderOptions> configure);
-
-    /// <summary>
-    /// Register a consumer that listens on a queue.
-    /// Each consumer has its own connection options — no shared global connection.
-    /// </summary>
-    public MqCSFrameworkBuilder AddConsumer(string name, Action<RabbitMqConsumerOptions> configure);
-
-    /// <summary>
-    /// Register an in-memory sender (for testing). Uses shared in-process channels.
-    /// </summary>
-    public MqCSFrameworkBuilder AddInMemorySender(string name);
-
-    /// <summary>
-    /// Register an in-memory consumer (for testing). Uses shared in-process channels.
-    /// </summary>
-    public MqCSFrameworkBuilder AddInMemoryConsumer(string name, string queueName);
-
-    /// <summary>
-    /// Add health checks for all registered sender/consumer connections.
-    /// Each connection is reported independently.
-    /// </summary>
-    public MqCSFrameworkBuilder AddHealthChecks();
-
-    /// <summary>
-    /// Replace the default System.Text.Json serializer.
-    /// </summary>
-    public MqCSFrameworkBuilder UseSerializer<TSerializer>()
-        where TSerializer : class, IMessageSerializer;
-}
-```
-
-
-#### Usage Example
-
-```csharp
-// Program.cs — Sender service connecting to TWO different RabbitMQ clusters
-var builder = Host.CreateApplicationBuilder(args);
-
-builder.Services.AddMqCSFramework(mq =>
-{
-    // Each sender/consumer carries its own connection options.
-    // No global UseRabbitMq() — connections are independent.
-    mq.AddSender("orders", opts =>
-    {
-        builder.Configuration.GetSection("MqCSFramework:Senders:orders").Bind(opts);
-    });
-    mq.AddRpcSender("inventory", opts =>
-    {
-        builder.Configuration.GetSection("MqCSFramework:RpcSenders:inventory").Bind(opts);
-    });
-    mq.AddHealthChecks();
-});
-
-var app = builder.Build();
-await app.RunAsync();
-
-// Usage in a service:
-public class OrderService(
-    [FromKeyedServices("orders")] IMessageSender sender,
-    [FromKeyedServices("inventory")] IRpcSender rpcSender)
-{
-    public async Task PlaceOrderAsync(OrderPlaced order)
-    {
-        // "orders" sender connects to rabbit-cluster-a
-        await sender.SendAsync(order);
-
-        // "inventory" RPC sender connects to rabbit-cluster-b (different broker!)
-        var stock = await rpcSender.SendAsync<CheckStockRequest, CheckStockResponse>(
-            new CheckStockRequest(order.ProductId));
-    }
-}
-```
-
-```csharp
-// Program.cs — Consumer service
-var builder = Host.CreateApplicationBuilder(args);
-
-// Register processors as standard DI singletons — no special builder method needed
-builder.Services.AddSingleton<IOrderPlacedProcessor, OrderPlacedProcessor>();
-
-builder.Services.AddMqCSFramework(mq =>
-{
-    mq.AddConsumer("orders", opts =>
-    {
-        builder.Configuration.GetSection("MqCSFramework:Consumers:orders").Bind(opts);
-    });
-    mq.AddHealthChecks();
-});
-
-var app = builder.Build();
-await app.RunAsync();
-
-// Contract interface (in shared contracts package):
-public interface IOrderPlacedProcessor : IMessageProcessor<OrderPlaced> { }
-
-// Processor implementation (in consumer project):
-public class OrderPlacedProcessor : IOrderPlacedProcessor
-{
-    public async Task ProcessAsync(OrderPlaced message, MessageContext context, CancellationToken ct)
-    {
-        // Handle the order...
-    }
-}
-```
-
-
-### Internal Components
-
-#### MessageDispatcher
-
-Resolves the processor from DI and dispatches the message. Replaces ProcessorRouter, ProcessorRegistration, and ProcessorTypeResolver.
-
-```csharp
-internal sealed class MessageDispatcher
-{
-    private readonly IServiceProvider _serviceProvider;
-    private readonly IMessageSerializer _serializer;
-    private readonly ILogger<MessageDispatcher> _logger;
-
-    // Cache: processor interface Type → TMessage type (resolved once from generic args)
-    private readonly ConcurrentDictionary<Type, Type> _messageTypeCache = new();
-    // Cache: processor interface Type → TResponse type (for RPC, resolved once)
-    private readonly ConcurrentDictionary<Type, Type> _responseTypeCache = new();
-
-    public async Task<ProcessResult> DispatchStandardAsync(ReceivedMessage message, CancellationToken ct);
-    public async Task<(ProcessResult result, byte[]? response)> DispatchRpcAsync(ReceivedMessage message, CancellationToken ct);
-}
-```
-
-**Dispatch flow:**
-1. Read `mq-processor-type` header → `Type.GetType(headerValue)` to get the processor interface type
-2. If null or header missing → NACK, throw `UnknownMessageTypeException`
-3. Resolve the processor from DI: `serviceProvider.GetService(processorInterfaceType)`
-4. If null → NACK (processor not registered)
-5. Get `TMessage` from the interface's generic args (cached in `_messageTypeCache`)
-6. Deserialize message body to `TMessage` using `IMessageSerializer`
-7. Call `ProcessAsync(message, context, ct)` via reflection-free invocation (cast to the known interface)
-8. For RPC: serialize the response and return the bytes
-
-No startup registration, no dictionaries, no `ProcessorRegistration` records. Just DI + one type cache.
-
-#### MessageMasker
-
-Utility for masking sensitive fields in JSON log output. Ported from reference's `JSONMessageMasker`.
-
-```csharp
-internal static class MessageMasker
-{
-    private const string MaskValue = "***MASKED***";
-
-    public static string Mask(string json, HashSet<string>? maskedFields);
-    public static HashSet<string>? BuildFieldSet(IList<string>? fieldNames);
-}
-```
-
-#### RpcPendingRequest
-
-Encapsulates a pending RPC request with timeout handling (replaces reference's `SenderTaskCompletionSource`).
-
-```csharp
-internal sealed class RpcPendingRequest<TResponse> : IDisposable where TResponse : class
-{
-    private readonly TaskCompletionSource<TResponse> _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly CancellationTokenSource _timeoutCts;
-
-    public Task<TResponse> Task => _tcs.Task;
-    public void SetResult(TResponse response);
-    public void SetException(Exception ex);
-    public void Dispose(); // Cancels timeout timer
-}
-```
-
-
-## Data Models
-
-### Message Envelope (Internal Transport Format)
-
-```csharp
-/// <summary>
-/// The internal envelope that wraps a serialized message for transport.
-/// </summary>
-public sealed record MessageEnvelope
-{
-    public required byte[] Body { get; init; }
-    public required string MessageId { get; init; }
-    public required string MessageType { get; init; }
-    public string? CorrelationId { get; init; }
-    public string? ReplyTo { get; init; }
-    public string? Exchange { get; init; }
-    public string? RoutingKey { get; init; }
-    public string ContentType { get; init; } = "application/json";
-    public bool Persistent { get; init; } = true;
-    public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
-    public string? SenderIdentity { get; init; }
-    public IDictionary<string, object?> Headers { get; init; } = new Dictionary<string, object?>();
-}
-```
-
-### Received Message (Consumer Side)
-
-```csharp
-/// <summary>
-/// A message received from the transport, before deserialization.
-/// </summary>
-public sealed record ReceivedMessage
-{
-    public required byte[] Body { get; init; }
-    public required ulong DeliveryTag { get; init; }
-    public required string MessageId { get; init; }
-    public required string MessageType { get; init; }
-    public string? CorrelationId { get; init; }
-    public string? ReplyTo { get; init; }
-    public string? Exchange { get; init; }
-    public string? RoutingKey { get; init; }
-    public string? ContentType { get; init; }
-    public DateTimeOffset Timestamp { get; init; }
-    public string? SenderIdentity { get; init; }
-    public IReadOnlyDictionary<string, object?> Headers { get; init; } = new Dictionary<string, object?>();
-    public bool Redelivered { get; init; }
-}
-```
-
-### Message Context (Processor Side)
-
-```csharp
-/// <summary>
-/// Context passed to processors. Contains metadata about the received message.
+/// Metadata available to processors when handling a message.
 /// </summary>
 public sealed record MessageContext
 {
     public required string MessageId { get; init; }
     public required string CorrelationId { get; init; }
-    public required string MessageType { get; init; }
-    public DateTimeOffset Timestamp { get; init; }
-    public string? SenderIdentity { get; init; }
-    public IReadOnlyDictionary<string, object?> Headers { get; init; } = new Dictionary<string, object?>();
-    public bool Redelivered { get; init; }
-    public CancellationToken CancellationToken { get; init; }
+    public required DateTimeOffset Timestamp { get; init; }
+    public required string Pattern { get; init; }
+    public required IReadOnlyDictionary<string, string> Headers { get; init; }
 }
 ```
 
-
-### Process Result (Internal)
+### Configuration Options
 
 ```csharp
+namespace MqCSFramework;
+
 /// <summary>
-/// Result of processing a message, used to determine ACK/NACK behavior.
+/// RabbitMQ connection settings shared by senders and consumers.
 /// </summary>
-public enum ProcessResult
+public sealed class RabbitMqConnectionOptions
 {
-    Success,
-    Failure,
-    Requeue
+    public required string HostName { get; set; }
+    public int Port { get; set; } = 5672;
+    public string UserName { get; set; } = "guest";
+    public string Password { get; set; } = "guest";
+    public string VirtualHost { get; set; } = "/";
+    public bool UseSsl { get; set; }
+    public string? ClientProvidedName { get; set; }
+}
+
+/// <summary>
+/// Options for configuring a standard sender.
+/// </summary>
+public sealed class StandardSenderOptions
+{
+    public required RabbitMqConnectionOptions Connection { get; set; }
+    public required string Exchange { get; set; }
+    public string RoutingKey { get; set; } = "";
+}
+
+/// <summary>
+/// Options for configuring an RPC sender.
+/// </summary>
+public sealed class RpcSenderOptions
+{
+    public required RabbitMqConnectionOptions Connection { get; set; }
+    public required string Exchange { get; set; }
+    public string RoutingKey { get; set; } = "";
+    public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
+}
+
+/// <summary>
+/// Options for configuring a consumer.
+/// </summary>
+public sealed class ConsumerOptions
+{
+    public required RabbitMqConnectionOptions Connection { get; set; }
+    public required string QueueName { get; set; }
+    public ushort PrefetchCount { get; set; } = 10;
+    public int MaxRetries { get; set; } = 3;
+    public string? DeadLetterExchange { get; set; }
+    public string? DeadLetterRoutingKey { get; set; }
+    public bool SuppressMessageBodyLogging { get; set; }
+    public IReadOnlyList<string> MaskedFields { get; set; } = [];
+}
+
+/// <summary>
+/// Per-message send options (override defaults).
+/// </summary>
+public sealed class SendOptions
+{
+    public string? RoutingKey { get; set; }
+    public string? CorrelationId { get; set; }
+    public IReadOnlyDictionary<string, string>? AdditionalHeaders { get; set; }
+}
+
+/// <summary>
+/// Per-message RPC options (override defaults).
+/// </summary>
+public sealed class RpcOptions
+{
+    public string? RoutingKey { get; set; }
+    public string? CorrelationId { get; set; }
+    public TimeSpan? Timeout { get; set; }
+    public IReadOnlyDictionary<string, string>? AdditionalHeaders { get; set; }
 }
 ```
 
-### RPC Error Response
+### Builder Pattern
 
 ```csharp
-/// <summary>
-/// Standard error response for RPC failures. Serialized and sent back to caller.
-/// </summary>
-public sealed record RpcErrorResponse
+namespace MqCSFramework;
+
+public static class ServiceCollectionExtensions
 {
-    public bool IsError { get; init; } = true;
-    public required string ErrorCode { get; init; }
-    public required string ErrorMessage { get; init; }
-    public string? StackTrace { get; init; }
+    public static IServiceCollection AddMqCSFramework(
+        this IServiceCollection services,
+        Action<MqBuilder> configure)
+    {
+        var builder = new MqBuilder(services);
+        configure(builder);
+        builder.Build();
+        return services;
+    }
+}
+
+public sealed class MqBuilder
+{
+    private readonly IServiceCollection _services;
+    private readonly List<ConsumerRegistration> _consumers = [];
+
+    internal MqBuilder(IServiceCollection services) => _services = services;
+
+    public MqBuilder AddSender(string name, Action<StandardSenderOptions> configure)
+    {
+        // Registers a keyed IStandardSender singleton
+        // Each sender gets its own RabbitMQ connection
+        return this;
+    }
+
+    public MqBuilder AddRpcSender(string name, Action<RpcSenderOptions> configure)
+    {
+        // Registers a keyed IRpcSender singleton
+        // Each sender gets its own RabbitMQ connection
+        return this;
+    }
+
+    public MqBuilder AddConsumer(string name, Action<ConsumerOptions> configure)
+    {
+        // Registers consumer configuration; actual hosting via BackgroundService
+        return this;
+    }
+
+    internal void Build()
+    {
+        // Registers ConsumerHostedService if any consumers configured
+        // Registers sender implementations as keyed services
+    }
 }
 ```
 
-### Configuration Models (appsettings.json)
+### Consumer Implementation
 
-Each sender, RPC sender, and consumer carries its own connection details. There is no shared connection section.
+```csharp
+namespace MqCSFramework.Internal;
+
+/// <summary>
+/// Manages a single consumer — owns its connection, channel, and message dispatch loop.
+/// </summary>
+internal sealed class MqConsumer : IAsyncDisposable
+{
+    private readonly ConsumerOptions _options;
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<MqConsumer> _logger;
+    private IConnection? _connection;
+    private IChannel? _channel;
+
+    public async Task StartAsync(CancellationToken ct)
+    {
+        // 1. Create connection via ConnectionFactory.CreateConnectionAsync()
+        // 2. Create channel via connection.CreateChannelAsync()
+        // 3. Set prefetch: channel.BasicQosAsync(prefetchCount)
+        // 4. Register AsyncEventingBasicConsumer
+        // 5. consumer.ReceivedAsync += DispatchMessage
+        // 6. channel.BasicConsumeAsync(queueName, autoAck: false, consumer)
+    }
+
+    private async Task DispatchMessage(object sender, BasicDeliverEventArgs ea)
+    {
+        // 1. Read mq-processor-type header → Type.GetType(value)
+        // 2. Read mq-pattern header ("standard" or "rpc")
+        // 3. Resolve processor from DI: _serviceProvider.GetService(processorType)
+        // 4. Deserialize body based on pattern
+        // 5. If standard: call ProcessAsync, ACK on success, NACK on failure
+        // 6. If RPC: call ProcessAsync, serialize response, publish to ReplyTo, ACK
+        // 7. Track retry count via x-death header or custom header; dead-letter if exceeded
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        // Close channel and connection gracefully
+    }
+}
+```
+
+### Consumer Hosted Service
+
+```csharp
+namespace MqCSFramework.Internal;
+
+/// <summary>
+/// BackgroundService that starts and manages all registered consumers.
+/// </summary>
+internal sealed class ConsumerHostedService : BackgroundService
+{
+    private readonly IReadOnlyList<MqConsumer> _consumers;
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Start all consumers in parallel
+        // Await stoppingToken cancellation
+        // On shutdown: dispose all consumers (triggers graceful close)
+    }
+}
+```
+
+### Connection Management
+
+```csharp
+namespace MqCSFramework.Internal;
+
+/// <summary>
+/// Manages a single RabbitMQ connection for a sender.
+/// Handles reconnection via RabbitMQ.Client's built-in automatic recovery.
+/// </summary>
+internal sealed class RabbitMqConnection : IAsyncDisposable
+{
+    private readonly RabbitMqConnectionOptions _options;
+    private IConnection? _connection;
+    private IChannel? _channel;
+
+    public async Task<IChannel> GetChannelAsync(CancellationToken ct)
+    {
+        // Lazily create connection + channel
+        // RabbitMQ.Client 7.x has built-in AutomaticRecoveryEnabled
+        // We rely on that rather than custom reconnect logic
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_channel is not null) await _channel.CloseAsync();
+        if (_connection is not null) await _connection.CloseAsync();
+        _channel?.Dispose();
+        _connection?.Dispose();
+    }
+}
+```
+
+### Standard Sender Implementation
+
+```csharp
+namespace MqCSFramework.Internal;
+
+internal sealed class RabbitMqStandardSender : IStandardSender
+{
+    private readonly RabbitMqConnection _connection;
+    private readonly StandardSenderOptions _options;
+    private readonly ILogger<RabbitMqStandardSender> _logger;
+
+    public async Task<string> SendAsync<TProcessor, TMessage>(
+        TMessage message, SendOptions? options = null, CancellationToken ct = default)
+        where TProcessor : IMessageProcessor<TMessage>
+        where TMessage : class
+    {
+        var messageId = Guid.NewGuid().ToString();
+        var correlationId = options?.CorrelationId ?? Guid.NewGuid().ToString();
+        var routingKey = options?.RoutingKey ?? _options.RoutingKey;
+
+        var body = JsonSerializer.SerializeToUtf8Bytes(message);
+
+        var props = new BasicProperties
+        {
+            MessageId = messageId,
+            CorrelationId = correlationId,
+            Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+            ContentType = "application/json",
+            Headers = new Dictionary<string, object?>
+            {
+                ["mq-processor-type"] = typeof(TProcessor).AssemblyQualifiedName,
+                ["mq-pattern"] = "standard"
+            }
+        };
+
+        // Merge additional headers if provided
+        var channel = await _connection.GetChannelAsync(ct);
+        await channel.BasicPublishAsync(_options.Exchange, routingKey, false, props, body, ct);
+
+        _logger.LogInformation("Published standard message {MessageId} for {Processor}",
+            messageId, typeof(TProcessor).Name);
+
+        return messageId;
+    }
+}
+```
+
+### RPC Sender Implementation
+
+```csharp
+namespace MqCSFramework.Internal;
+
+internal sealed class RabbitMqRpcSender : IRpcSender
+{
+    private readonly RabbitMqConnection _connection;
+    private readonly RpcSenderOptions _options;
+    private readonly ILogger<RabbitMqRpcSender> _logger;
+
+    // Pending RPC calls awaiting responses
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<byte[]>> _pending = new();
+
+    public async Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(
+        TRequest request, RpcOptions? options = null, CancellationToken ct = default)
+        where TProcessor : IRpcProcessor<TRequest, TResponse>
+        where TRequest : class
+        where TResponse : class
+    {
+        var messageId = Guid.NewGuid().ToString();
+        var correlationId = options?.CorrelationId ?? messageId;
+        var timeout = options?.Timeout ?? _options.Timeout;
+        var routingKey = options?.RoutingKey ?? _options.RoutingKey;
+
+        var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pending[correlationId] = tcs;
+
+        try
+        {
+            var body = JsonSerializer.SerializeToUtf8Bytes(request);
+            var channel = await _connection.GetChannelAsync(ct);
+
+            var props = new BasicProperties
+            {
+                MessageId = messageId,
+                CorrelationId = correlationId,
+                ReplyTo = "amq.rabbitmq.reply-to", // Direct Reply-to
+                Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+                ContentType = "application/json",
+                Headers = new Dictionary<string, object?>
+                {
+                    ["mq-processor-type"] = typeof(TProcessor).AssemblyQualifiedName,
+                    ["mq-pattern"] = "rpc"
+                }
+            };
+
+            await channel.BasicPublishAsync(_options.Exchange, routingKey, false, props, body, ct);
+
+            // Await response with timeout
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout);
+
+            var responseBytes = await tcs.Task.WaitAsync(cts.Token);
+
+            // Check for error response
+            // Deserialize and return
+            return JsonSerializer.Deserialize<TResponse>(responseBytes)
+                ?? throw new InvalidOperationException("Failed to deserialize RPC response");
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new RpcTimeoutException(correlationId, timeout);
+        }
+        finally
+        {
+            _pending.TryRemove(correlationId, out _);
+        }
+    }
+
+    // Called by the reply consumer when a response arrives
+    internal void HandleReply(string correlationId, byte[] body, bool isError)
+    {
+        if (!_pending.TryGetValue(correlationId, out var tcs))
+            return;
+
+        if (isError)
+        {
+            var errorMessage = JsonSerializer.Deserialize<string>(body) ?? "Unknown remote error";
+            tcs.SetException(new RpcRemoteException(correlationId, errorMessage));
+            return;
+        }
+
+        tcs.SetResult(body);
+    }
+}
+```
+
+## Data Models
+
+### Wire Format
+
+Messages on the wire have this structure:
+
+| Component | Content |
+|-----------|---------|
+| Body | UTF-8 JSON-serialized message/request |
+| Header: `mq-processor-type` | Processor interface AssemblyQualifiedName (e.g., `MyApp.Contracts.IOrderProcessor, MyApp.Contracts`) |
+| Header: `mq-pattern` | `"standard"` or `"rpc"` |
+| Property: `MessageId` | GUID string |
+| Property: `CorrelationId` | GUID string (links request to response) |
+| Property: `Timestamp` | Unix epoch seconds |
+| Property: `ReplyTo` | Reply queue (RPC only, uses Direct Reply-to) |
+| Property: `ContentType` | `"application/json"` |
+
+### RPC Response Envelope
+
+For RPC responses published back to the reply queue:
+
+```csharp
+internal sealed record RpcResponseEnvelope
+{
+    public required bool IsError { get; init; }
+    public required byte[] Payload { get; init; }
+    public string? ErrorMessage { get; init; }
+    public string? ErrorType { get; init; }
+}
+```
+
+When a processor throws, the consumer serializes:
+```json
+{
+  "isError": true,
+  "payload": null,
+  "errorMessage": "Order not found",
+  "errorType": "System.InvalidOperationException"
+}
+```
+
+On success:
+```json
+{
+  "isError": false,
+  "payload": "<base64 encoded TResponse JSON>"
+}
+```
+
+### Dead Letter Tracking
+
+Retry count is tracked via a custom header `mq-retry-count` (integer). On each NACK + requeue, the consumer increments this header. When `mq-retry-count >= MaxRetries`, the message is published to the dead-letter exchange instead of being requeued.
+
+
+
+## Correctness Properties
+
+*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+
+### Property 1: Message Envelope Correctness
+
+*For any* processor type `TProcessor` and any valid message, when `SendAsync<TProcessor, TMessage>` is called (standard or RPC), the resulting published message SHALL have:
+- Header `mq-processor-type` equal to `typeof(TProcessor).AssemblyQualifiedName`
+- Header `mq-pattern` equal to `"standard"` for `IStandardSender` or `"rpc"` for `IRpcSender`
+- A non-empty `MessageId` that is a valid GUID
+- A `Timestamp` > 0 representing the current time
+- A non-empty `CorrelationId`
+
+**Validates: Requirements 1.3, 1.4, 1.5, 2.3, 2.4**
+
+### Property 2: Serialization Round-Trip
+
+*For any* valid message object of type `TMessage`, serializing it to JSON bytes and then deserializing those bytes back to `TMessage` SHALL produce an object equal to the original.
+
+**Validates: Requirements 1.6, 7.1**
+
+### Property 3: Consumer Dispatch Correctness
+
+*For any* message with a valid `mq-processor-type` header referencing a processor registered in DI, and a valid `mq-pattern` header (`"standard"` or `"rpc"`), the consumer SHALL:
+- Resolve the correct processor from the service provider
+- Deserialize the body to the processor's expected message type
+- Call `ProcessAsync` on that processor with the deserialized message and a valid `MessageContext`
+
+**Validates: Requirements 3.2, 3.3, 3.4, 3.5**
+
+### Property 4: RPC Round-Trip Correlation
+
+*For any* RPC request sent with a `CorrelationId`, when the consumer processes it successfully and publishes a response, the response SHALL carry the same `CorrelationId` and the sender SHALL receive the deserialized `TResponse` object matching what the processor returned.
+
+**Validates: Requirements 2.5, 2.6**
+
+### Property 5: RPC Error Propagation
+
+*For any* RPC request where the processor throws an exception, the sender SHALL receive an `RpcRemoteException` containing the original exception's message.
+
+**Validates: Requirements 2.8**
+
+### Property 6: Processor Fault Tolerance
+
+*For any* message where the processor throws an exception, the consumer SHALL NACK the message and continue processing subsequent messages without crashing.
+
+**Validates: Requirements 9.1, 9.2**
+
+### Property 7: Dead-Letter Routing on Retry Exhaustion
+
+*For any* message with a retry count greater than or equal to `MaxRetries`, the consumer SHALL publish the message to the configured dead-letter exchange rather than requeuing it.
+
+**Validates: Requirements 9.3**
+
+### Property 8: Sensitive Field Masking
+
+*For any* message containing fields whose names appear in the configured `MaskedFields` list, the logged representation SHALL replace those field values with `"***MASKED***"` while preserving all non-masked field values.
+
+**Validates: Requirements 8.4**
+
+### Property 9: Correlation ID Propagation in Logs
+
+*For any* message processed by the consumer, all log entries emitted during that message's processing SHALL include the message's `CorrelationId`.
+
+**Validates: Requirements 8.2**
+
+## Error Handling
+
+### Exception Types
+
+```csharp
+namespace MqCSFramework;
+
+/// <summary>Thrown when an RPC call times out waiting for a response.</summary>
+public sealed class RpcTimeoutException : Exception
+{
+    public string CorrelationId { get; }
+    public TimeSpan Timeout { get; }
+
+    public RpcTimeoutException(string correlationId, TimeSpan timeout)
+        : base($"RPC call {correlationId} timed out after {timeout.TotalSeconds}s")
+    {
+        CorrelationId = correlationId;
+        Timeout = timeout;
+    }
+}
+
+/// <summary>Thrown when the remote processor threw an exception during RPC processing.</summary>
+public sealed class RpcRemoteException : Exception
+{
+    public string CorrelationId { get; }
+    public string RemoteExceptionType { get; }
+
+    public RpcRemoteException(string correlationId, string message, string? remoteExceptionType = null)
+        : base($"Remote processor error for {correlationId}: {message}")
+    {
+        CorrelationId = correlationId;
+        RemoteExceptionType = remoteExceptionType ?? "Unknown";
+    }
+}
+
+/// <summary>Thrown when message serialization/deserialization fails.</summary>
+public sealed class MessageSerializationException : Exception
+{
+    public string? MessageId { get; }
+
+    public MessageSerializationException(string message, string? messageId = null, Exception? inner = null)
+        : base(message, inner)
+    {
+        MessageId = messageId;
+    }
+}
+```
+
+### Error Handling Strategy
+
+| Scenario | Sender Behavior | Consumer Behavior |
+|----------|----------------|-------------------|
+| Processor throws | N/A | NACK, increment retry count, requeue (or dead-letter if retries exhausted) |
+| Serialization failure (consumer) | N/A | NACK without requeue (message is malformed), log error |
+| Missing `mq-processor-type` header | N/A | NACK without requeue, log warning |
+| Unresolvable processor type | N/A | NACK without requeue, log error |
+| RPC timeout | Throw `RpcTimeoutException` | N/A |
+| RPC processor throws | Throw `RpcRemoteException` | Publish error envelope to reply queue, ACK original |
+| Connection lost | Exception on next send (auto-recovery handles reconnect) | Auto-recovery reconnects, consumer re-subscribes |
+| Serialization failure (sender) | Throw `MessageSerializationException` | N/A |
+
+### Consumer Error Flow
+
+```mermaid
+flowchart TD
+    MSG[Message Received] --> HDR{Has mq-processor-type header?}
+    HDR -->|No| NACK1[NACK without requeue + log warning]
+    HDR -->|Yes| RESOLVE{Type.GetType succeeds?}
+    RESOLVE -->|No| NACK2[NACK without requeue + log error]
+    RESOLVE -->|Yes| DI{DI resolves service?}
+    DI -->|No| NACK3[NACK without requeue + log error]
+    DI -->|Yes| DESER{Deserialize body?}
+    DESER -->|Fail| NACK4[NACK without requeue + log error]
+    DESER -->|OK| PROCESS[Call ProcessAsync]
+    PROCESS -->|Success, Standard| ACK1[ACK]
+    PROCESS -->|Success, RPC| REPLY[Publish response to ReplyTo] --> ACK2[ACK]
+    PROCESS -->|Throws| RETRY{retry count >= MaxRetries?}
+    RETRY -->|No| REQUEUE[NACK with requeue, increment retry header]
+    RETRY -->|Yes| DLQ[Publish to dead-letter exchange] --> ACK3[ACK]
+```
+
+## Testing Strategy
+
+### Property-Based Testing
+
+**Library:** [FsCheck](https://fscheck.github.io/FsCheck/) (via FsCheck.Xunit) — well-established property-based testing for .NET.
+
+**Configuration:**
+- Minimum 100 iterations per property test
+- Each property test references its design document property
+- Tag format: `Feature: queue-framework, Property {number}: {description}`
+
+**Properties to implement as PBT:**
+1. Message Envelope Correctness — generate random processor types and messages, verify headers
+2. Serialization Round-Trip — generate random message records, verify serialize/deserialize identity
+3. Consumer Dispatch Correctness — generate random registered processors + matching messages, verify dispatch
+4. RPC Round-Trip Correlation — generate random requests/responses, verify correlation through the pipeline
+5. RPC Error Propagation — generate random exceptions from processors, verify RpcRemoteException at sender
+6. Processor Fault Tolerance — generate random exceptions, verify NACK + consumer continuity
+7. Dead-Letter Routing — generate messages with varying retry counts, verify dead-letter threshold
+8. Sensitive Field Masking — generate messages with random field names (some masked, some not), verify log output
+9. Correlation ID Propagation — generate random correlation IDs, verify they appear in all log entries
+
+### Unit Tests (Example-Based)
+
+- DI registration: AddSender, AddRpcSender, AddConsumer resolve correctly
+- Keyed service injection via `[FromKeyedServices]`
+- Configuration binding from IConfiguration
+- RPC timeout behavior (short timeout, no consumer)
+- Missing header rejection
+- Unregistered processor type rejection
+- Multiple consumers in single host
+
+### Integration Tests
+
+- End-to-end standard message flow with real RabbitMQ (via Testcontainers)
+- End-to-end RPC flow with real RabbitMQ
+- Connection failure and automatic recovery
+- Multiple independent connections to different virtual hosts
+- Dead-letter exchange routing with actual broker
+
+### Test Project Structure
+
+```
+tests/
+  MqCSFramework.Tests/
+    Properties/           ← Property-based tests (FsCheck)
+      MessageEnvelopePropertyTests.cs
+      SerializationRoundTripPropertyTests.cs
+      ConsumerDispatchPropertyTests.cs
+      RpcRoundTripPropertyTests.cs
+      FaultTolerancePropertyTests.cs
+      DeadLetterPropertyTests.cs
+      LogMaskingPropertyTests.cs
+    Unit/                 ← Example-based unit tests
+      BuilderTests.cs
+      DiRegistrationTests.cs
+      ConfigurationBindingTests.cs
+      ErrorHandlingTests.cs
+    Integration/          ← Real RabbitMQ tests (Testcontainers)
+      StandardFlowTests.cs
+      RpcFlowTests.cs
+      ConnectionResilienceTests.cs
+```
+
+## Usage Examples
+
+### Shared Contracts Project
+
+```csharp
+// MyApp.Contracts/Messages/OrderMessage.cs
+namespace MyApp.Contracts.Messages;
+
+public record OrderMessage(Guid OrderId, string CustomerName, decimal Amount, DateTimeOffset CreatedAt);
+```
+
+```csharp
+// MyApp.Contracts/Messages/StockRequest.cs
+namespace MyApp.Contracts.Messages;
+
+public record StockRequest(string Sku, int Quantity);
+public record StockResponse(bool Available, int RemainingStock, decimal UnitPrice);
+```
+
+```csharp
+// MyApp.Contracts/Processors/IOrderProcessor.cs
+using MqCSFramework;
+
+namespace MyApp.Contracts.Processors;
+
+public interface IOrderProcessor : IMessageProcessor<OrderMessage>;
+```
+
+```csharp
+// MyApp.Contracts/Processors/IStockProcessor.cs
+using MqCSFramework;
+
+namespace MyApp.Contracts.Processors;
+
+public interface IStockProcessor : IRpcProcessor<StockRequest, StockResponse>;
+```
+
+### Sender Program
+
+```csharp
+// MyApp.Sender/Program.cs
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using MqCSFramework;
+using MyApp.Contracts.Messages;
+using MyApp.Contracts.Processors;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+builder.Services.AddMqCSFramework(mq =>
+{
+    mq.AddSender("orders", opts =>
+    {
+        opts.Connection = new RabbitMqConnectionOptions
+        {
+            HostName = "localhost",
+            ClientProvidedName = "order-sender"
+        };
+        opts.Exchange = "orders-exchange";
+        opts.RoutingKey = "orders.new";
+    });
+
+    mq.AddRpcSender("stock", opts =>
+    {
+        opts.Connection = new RabbitMqConnectionOptions
+        {
+            HostName = "localhost",
+            ClientProvidedName = "stock-rpc-sender"
+        };
+        opts.Exchange = "stock-exchange";
+        opts.RoutingKey = "stock.check";
+        opts.Timeout = TimeSpan.FromSeconds(10);
+    });
+});
+
+var app = builder.Build();
+
+// Standard send
+var standardSender = app.Services.GetRequiredKeyedService<IStandardSender>("orders");
+var messageId = await standardSender.SendAsync<IOrderProcessor, OrderMessage>(
+    new OrderMessage(Guid.NewGuid(), "Alice", 99.99m, DateTimeOffset.UtcNow));
+
+Console.WriteLine($"Order sent: {messageId}");
+
+// RPC send
+var rpcSender = app.Services.GetRequiredKeyedService<IRpcSender>("stock");
+var response = await rpcSender.SendAsync<IStockProcessor, StockResponse, StockRequest>(
+    new StockRequest("SKU-12345", 2));
+
+Console.WriteLine($"Stock check: Available={response.Available}, Remaining={response.RemainingStock}");
+```
+
+### Consumer Program
+
+```csharp
+// MyApp.Consumer/Program.cs
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using MqCSFramework;
+using MyApp.Consumer.Processors;
+using MyApp.Contracts.Processors;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+// Register processors as standard DI singletons
+builder.Services.AddSingleton<IOrderProcessor, OrderProcessor>();
+builder.Services.AddSingleton<IStockProcessor, StockProcessor>();
+
+builder.Services.AddMqCSFramework(mq =>
+{
+    mq.AddConsumer("orders", opts =>
+    {
+        opts.Connection = new RabbitMqConnectionOptions
+        {
+            HostName = "localhost",
+            ClientProvidedName = "order-consumer"
+        };
+        opts.QueueName = "orders-queue";
+        opts.PrefetchCount = 20;
+        opts.MaxRetries = 3;
+        opts.DeadLetterExchange = "orders-dlx";
+        opts.SuppressMessageBodyLogging = false;
+        opts.MaskedFields = ["password", "creditCard"];
+    });
+
+    mq.AddConsumer("stock", opts =>
+    {
+        opts.Connection = new RabbitMqConnectionOptions
+        {
+            HostName = "localhost",
+            ClientProvidedName = "stock-consumer"
+        };
+        opts.QueueName = "stock-queue";
+        opts.PrefetchCount = 10;
+    });
+});
+
+await builder.Build().RunAsync();
+```
+
+```csharp
+// MyApp.Consumer/Processors/OrderProcessor.cs
+using MqCSFramework;
+using MyApp.Contracts.Messages;
+using MyApp.Contracts.Processors;
+
+namespace MyApp.Consumer.Processors;
+
+public class OrderProcessor(ILogger<OrderProcessor> logger) : IOrderProcessor
+{
+    public async Task ProcessAsync(OrderMessage message, MessageContext context, CancellationToken ct = default)
+    {
+        logger.LogInformation("Processing order {OrderId} for {Customer}",
+            message.OrderId, message.CustomerName);
+
+        // Business logic here...
+        await Task.CompletedTask;
+    }
+}
+```
+
+```csharp
+// MyApp.Consumer/Processors/StockProcessor.cs
+using MqCSFramework;
+using MyApp.Contracts.Messages;
+using MyApp.Contracts.Processors;
+
+namespace MyApp.Consumer.Processors;
+
+public class StockProcessor(ILogger<StockProcessor> logger) : IStockProcessor
+{
+    public Task<StockResponse> ProcessAsync(StockRequest request, MessageContext context, CancellationToken ct = default)
+    {
+        logger.LogInformation("Checking stock for SKU {Sku}, quantity {Qty}",
+            request.Sku, request.Quantity);
+
+        // Business logic...
+        var response = new StockResponse(Available: true, RemainingStock: 42, UnitPrice: 19.99m);
+        return Task.FromResult(response);
+    }
+}
+```
+
+### appsettings.json Configuration Example
 
 ```json
 {
@@ -956,365 +985,38 @@ Each sender, RPC sender, and consumer carries its own connection details. There 
     "Senders": {
       "orders": {
         "Connection": {
-          "HostNames": "rabbit-cluster-a-node1,rabbit-cluster-a-node2",
-          "UserName": "orders-svc",
-          "Password": "***",
-          "VirtualHost": "/orders",
-          "SslServerName": null,
-          "AutomaticRecoveryEnabled": true,
-          "NetworkRecoveryInterval": "00:00:05"
+          "HostName": "rabbitmq.prod.internal",
+          "Port": 5672,
+          "UserName": "app-sender",
+          "Password": "secret",
+          "VirtualHost": "/production",
+          "UseSsl": true,
+          "ClientProvidedName": "order-service-sender"
         },
-        "Exchange": "",
-        "RoutingKey": "orders-queue",
-        "ConfirmSelect": true,
-        "MaskedFields": ["CardNumber", "CVV"],
-        "MessageLogLevel": "Information",
-        "LogMessageBody": true
-      }
-    },
-    "RpcSenders": {
-      "inventory": {
-        "Connection": {
-          "HostNames": "rabbit-cluster-b-node1,rabbit-cluster-b-node2",
-          "UserName": "inventory-svc",
-          "Password": "***",
-          "VirtualHost": "/inventory",
-          "SslServerName": "rabbit-cluster-b.internal",
-          "AutomaticRecoveryEnabled": true,
-          "NetworkRecoveryInterval": "00:00:05"
-        },
-        "RoutingKey": "inventory-queue",
-        "DefaultTimeout": "00:00:10",
-        "MaxRetryAttempts": 3
+        "Exchange": "orders-exchange",
+        "RoutingKey": "orders.new"
       }
     },
     "Consumers": {
       "orders": {
         "Connection": {
-          "HostNames": "rabbit-cluster-a-node1,rabbit-cluster-a-node2",
-          "UserName": "orders-consumer",
-          "Password": "***",
-          "VirtualHost": "/orders",
-          "SslServerName": null,
-          "AutomaticRecoveryEnabled": true,
-          "NetworkRecoveryInterval": "00:00:05"
+          "HostName": "rabbitmq.prod.internal",
+          "Port": 5672,
+          "UserName": "app-consumer",
+          "Password": "secret",
+          "VirtualHost": "/production",
+          "UseSsl": true,
+          "ClientProvidedName": "order-service-consumer"
         },
         "QueueName": "orders-queue",
         "PrefetchCount": 20,
-        "AutoAck": false,
-        "IsRpc": false,
-        "ProcessingTimeoutMs": 30000,
-        "DelayRetryLimit": 3,
-        "ErrorQueueName": "orders-queue-error"
+        "MaxRetries": 5,
+        "DeadLetterExchange": "orders-dlx",
+        "DeadLetterRoutingKey": "orders.dead",
+        "SuppressMessageBodyLogging": true,
+        "MaskedFields": ["password", "token", "creditCardNumber"]
       }
     }
   }
 }
 ```
-
-> **Note:** Even when two endpoints connect to the same broker, they maintain independent connections. This is intentional — it provides fault isolation and allows different credentials/virtual hosts per endpoint.
-
-
-### OpenTelemetry / Tracing Model
-
-```csharp
-internal static class MqTracing
-{
-    public static readonly ActivitySource Source = new("MqCSFramework", "1.0.0");
-
-    // Span names follow OTel messaging semantic conventions:
-    // "{destination} publish" for producers
-    // "{destination} process" for consumers
-
-    public static Activity? StartPublishActivity(MessageEnvelope envelope)
-    {
-        var activity = Source.StartActivity($"{envelope.RoutingKey} publish", ActivityKind.Producer);
-        activity?.SetTag("messaging.system", "rabbitmq");
-        activity?.SetTag("messaging.destination.name", envelope.RoutingKey);
-        activity?.SetTag("messaging.message.id", envelope.MessageId);
-        activity?.SetTag("messaging.message.conversation_id", envelope.CorrelationId);
-        // Inject W3C trace context into headers
-        return activity;
-    }
-
-    public static Activity? StartConsumeActivity(ReceivedMessage message)
-    {
-        // Extract parent context from message headers (W3C Trace Context)
-        var parentContext = ExtractTraceContext(message.Headers);
-        var activity = Source.StartActivity(
-            $"{message.RoutingKey} process",
-            ActivityKind.Consumer,
-            parentContext);
-        activity?.SetTag("messaging.system", "rabbitmq");
-        activity?.SetTag("messaging.destination.name", message.RoutingKey);
-        activity?.SetTag("messaging.message.id", message.MessageId);
-        return activity;
-    }
-}
-```
-
-### Header Constants
-
-```csharp
-public static class MessageHeaders
-{
-    public const string MessageType = "mq-message-type";
-    public const string ProcessorType = "mq-processor-type";
-    public const string CorrelationId = "mq-correlation-id";
-    public const string SenderIdentity = "mq-sender-identity";
-    public const string LocalDateTime = "mq-local-datetime";
-    public const string TraceParent = "traceparent";
-    public const string TraceState = "tracestate";
-}
-```
-
-
-## Correctness Properties
-
-*A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
-
-### Property 1: Envelope Construction Invariant
-
-*For any* valid message object and send options, the produced `MessageEnvelope` SHALL contain: a non-empty serialized body, a non-empty MessageId (GUID), a non-null MessageType (the message class full name), a timestamp, and all optional metadata (CorrelationId, SenderIdentity, RoutingKey) matching the provided options.
-
-**Validates: Requirements 2.1, 2.2**
-
-### Property 2: Message Routing Correctness
-
-*For any* set of N registered processors (each handling a distinct message type), and any message with a `mq-processor-type` header matching one of those registrations, the consumer SHALL invoke exactly the processor identified by that header. Messages without the `mq-processor-type` header SHALL be rejected (NACK'd). No other processors SHALL be invoked.
-
-**Validates: Requirements 2.5, 5.3, 8.2, 8.4**
-
-### Property 18: Processor Type Resolution Correctness
-
-*For any* type `TProcessor` that implements `IMessageProcessor<TMessage>` or `IRpcProcessor<TRequest, TResponse>`, the sender SHALL correctly resolve the generic type arguments (TMessage, or TRequest/TResponse) and produce a `MessageEnvelope` where the body matches the expected request type and the `mq-processor-type` header contains the full type name of `TProcessor`.
-
-**Validates: Requirements 2.1, 3.1, 8.1**
-
-### Property 3: ACK on Successful Processing
-
-*For any* message where the registered processor completes without throwing an exception, the consumer SHALL acknowledge (ACK) that message's delivery tag exactly once.
-
-**Validates: Requirements 2.6**
-
-### Property 4: NACK on Processing Failure
-
-*For any* message where the registered processor throws an exception, the consumer SHALL negatively acknowledge (NACK) that message's delivery tag. The requeue parameter SHALL match the configured requeue behavior.
-
-**Validates: Requirements 2.7, 10.2**
-
-
-### Property 5: Unknown Message Type NACK
-
-*For any* message with a Type header that does not match any registered processor, the consumer SHALL NACK the message (without requeue) and log a warning containing the unknown type name.
-
-**Validates: Requirements 8.3**
-
-### Property 6: RPC Response Round-Trip
-
-*For any* valid request message of type TRequest, when the RPC processor returns a TResponse, the sender SHALL receive a correctly deserialized TResponse matching the processor's output. When the processor throws, the sender SHALL receive an exception containing the error details.
-
-**Validates: Requirements 3.1, 3.3, 3.5, 13.3**
-
-### Property 7: RPC Concurrent Correlation
-
-*For any* set of N concurrent RPC requests (each with a unique messageId), when N responses arrive (potentially out of order), each response SHALL be matched to exactly its originating request — no cross-contamination between pending requests.
-
-**Validates: Requirements 3.2, 3.6**
-
-### Property 8: Serialization Round-Trip
-
-*For any* valid message object, serializing it with the configured `IMessageSerializer` and then deserializing the result back to the same type SHALL produce an object equivalent to the original.
-
-**Validates: Requirements 4.1, 4.2**
-
-### Property 9: Consumer Resilience
-
-*For any* sequence of messages where some processors throw exceptions, the consumer SHALL remain running and continue processing subsequent messages. A processor failure SHALL NOT terminate the consumer loop.
-
-**Validates: Requirements 10.1**
-
-
-### Property 10: Error Queue Routing on Retry Exhaustion
-
-*For any* message that has been retried more than `DelayRetryLimit` times (as indicated by x-death count), the consumer SHALL ACK the original delivery and publish the message to the configured error queue.
-
-**Validates: Requirements 10.3**
-
-### Property 11: Sender Reset-on-Failure
-
-*For any* message publish that fails due to a transport error on that sender's dedicated connection, the sender SHALL reset its channel state and succeed on a subsequent retry attempt (assuming the transport is available again). Other senders/consumers with independent connections SHALL NOT be affected.
-
-**Validates: Requirements 7.2**
-
-### Property 12: Message Field Masking
-
-*For any* JSON message string and a configured set of field names to mask, the `MessageMasker.Mask()` output SHALL replace the values of those fields with "***MASKED***" while preserving all other fields unchanged. The masking SHALL be case-insensitive on field names.
-
-**Validates: Requirements 9.5**
-
-### Property 13: Trace Context Propagation Round-Trip
-
-*For any* message published under an active Activity, the message headers SHALL contain a valid `traceparent` header (W3C format). When that message is consumed, the consumer's Activity SHALL have a parent context that matches the producer's trace ID and span ID.
-
-**Validates: Requirements 12.2, 12.3, 12.4**
-
-### Property 14: Correlation ID Preservation
-
-*For any* message sent with a correlation ID (either explicit or auto-generated), the `MessageContext` received by the processor SHALL contain that same correlation ID value.
-
-**Validates: Requirements 9.2**
-
-### Property 15: Transport Interchangeability
-
-*For any* valid message, sending it through the InMemory transport and receiving it SHALL produce a `MessageContext` and deserialized message equivalent to what would be produced through the RabbitMQ transport — the application-level processor code is transport-agnostic.
-
-**Validates: Requirements 1.4**
-
-### Property 16: Connection Isolation
-
-*For any* set of N registered senders/consumers each with their own connection, when one connection fails (broker goes down, credentials revoked, network partition), all other connections SHALL remain unaffected — their `IsConnected` status, channel operations, and health check results are independent.
-
-**Validates: Requirements 7.1, 7.2, 7.3, 11.4**
-
-### Property 17: Per-Connection Health Reporting
-
-*For any* registered sender/consumer with its own connection, the health check system SHALL report that specific connection's status independently. If sender "orders" is healthy and consumer "payments" is unhealthy, the health endpoint SHALL reflect both statuses separately (not collapse to a single aggregate).
-
-**Validates: Requirements 11.1, 11.2, 11.4**
-
-
-## Error Handling
-
-### Strategy Overview
-
-The framework applies a layered error handling strategy:
-
-| Layer | Error Type | Behavior |
-|-------|-----------|----------|
-| Transport (connection) | Connection lost | Log error, fire `ConnectionLost` event on that specific connection, begin auto-reconnect with exponential backoff. Other connections unaffected. |
-| Transport (channel) | Channel error on publish | Reset channel on that sender's connection, retry (up to MaxRetryAttempts), propagate exception on exhaustion |
-| Serialization | Deserialization failure | NACK without requeue (malformed messages cannot be fixed by retry), log with message ID |
-| Processor (standard) | Unhandled exception | NACK with configurable requeue; if retry limit exceeded → route to error queue |
-| Processor (RPC) | Unhandled exception | Serialize `RpcErrorResponse`, send back to reply queue, NACK the request message |
-| RPC timeout | No response within timeout | Cancel `TaskCompletionSource`, throw `RpcTimeoutException` with correlation details |
-| RPC error response | Error response received | Deserialize `RpcErrorResponse`, throw `RpcRemoteException` with error code and message |
-
-### Exception Types
-
-```csharp
-namespace MqCSFramework.Abstractions;
-
-/// <summary>Base exception for all MqCSFramework errors.</summary>
-public class MqException : Exception { }
-
-/// <summary>RPC call timed out waiting for response.</summary>
-public class RpcTimeoutException : MqException
-{
-    public string CorrelationId { get; }
-    public string MessageId { get; }
-    public TimeSpan Timeout { get; }
-}
-
-/// <summary>RPC remote processor returned an error response.</summary>
-public class RpcRemoteException : MqException
-{
-    public string ErrorCode { get; }
-    public string RemoteMessage { get; }
-    public string? RemoteStackTrace { get; }
-}
-
-/// <summary>Serialization/deserialization failure.</summary>
-public class MessageSerializationException : MqException
-{
-    public string? MessageId { get; }
-    public Type? TargetType { get; }
-}
-
-/// <summary>No processor registered for message type.</summary>
-public class UnknownMessageTypeException : MqException
-{
-    public string MessageType { get; }
-}
-```
-
-### Error Queue / Dead Letter Pattern
-
-When `DelayRetryLimit > 0` and `ErrorQueueName` is configured:
-
-1. Consumer tracks retry count via the `x-death` header (set by RabbitMQ dead-letter exchange mechanism)
-2. If retry count >= `DelayRetryLimit`: ACK the message, publish to `ErrorQueueName`
-3. If retry count < limit: NACK with requeue=false (relies on DLX to re-route back after delay)
-
-This replicates the proven pattern from the reference implementation's `TrySendToErrorQueueAsync`.
-
-
-## Testing Strategy
-
-### Approach
-
-The framework uses a dual testing approach combining property-based tests for universal correctness guarantees with example-based tests for specific behaviors and integration verification.
-
-### Property-Based Testing
-
-**Library:** [FsCheck](https://github.com/fscheck/FsCheck) with xUnit integration (`FsCheck.Xunit`)
-
-**Configuration:** Minimum 100 iterations per property test.
-
-**Tag format:** Each property test includes a comment referencing its design property:
-```csharp
-// Feature: queue-framework, Property 8: Serialization round-trip
-```
-
-Property tests focus on the pure/testable logic layers:
-- `MessageEnvelope` construction (Property 1)
-- `ProcessorRouter` dispatch logic (Property 2)
-- ACK/NACK decision logic (Properties 3, 4, 5)
-- RPC correlation matching (Property 7)
-- `IMessageSerializer` round-trip (Property 8)
-- `MessageMasker` field masking (Property 12)
-- Trace context inject/extract round-trip (Property 13)
-- Correlation ID flow (Property 14)
-- Connection isolation (Property 16)
-
-For properties that involve async message flow (Properties 6, 9, 10, 11, 15, 17), the InMemory transport provides a fast, deterministic test harness that avoids external dependencies while exercising the full pipeline.
-
-### Unit Tests (Example-Based)
-
-Focus on:
-- DI registration verification (all services resolvable, each with own connection)
-- Configuration binding (appsettings per-sender/consumer → options including nested Connection)
-- Specific edge cases: timeout exception, empty message rejection, unknown type handling
-- Health check state transitions per connection (Connected→Healthy, Reconnecting→Degraded, Disconnected→Unhealthy)
-- Multiple named/keyed instances coexist correctly with independent connections
-- Log output verification (message bodies suppressed when configured, secrets not logged)
-- Connection names match registration names in health check output
-
-### Integration Tests
-
-Focus on:
-- Full RabbitMQ round-trip (requires Testcontainers or local broker)
-- Connection loss on one sender → other senders/consumers unaffected (isolation)
-- Connection loss → auto-recovery → resume consuming (per connection)
-- Publisher confirms (confirm-select enabled)
-- Consumer hosted service lifecycle (start/stop)
-- Dead-letter exchange retry cycle with error queue routing
-- Multi-broker scenario: sender to broker A, consumer from broker B (different connection configs)
-
-### Test Project Structure
-
-```
-tests/
-├── MqCSFramework.Abstractions.Tests/      # Property tests for models, serialization, masking
-├── MqCSFramework.Routing.Tests/           # Property tests for ProcessorRouter
-├── MqCSFramework.InMemory.Tests/          # Property tests using InMemory end-to-end
-├── MqCSFramework.RabbitMQ.Tests/          # Unit tests for RabbitMQ-specific logic
-└── MqCSFramework.Integration.Tests/       # Integration tests (Testcontainers + RabbitMQ)
-```
-
-### Non-Functional Verification
-
-- **Performance:** Benchmark tests using BenchmarkDotNet for publish/consume hot paths
-- **Allocations:** Verify zero unnecessary allocations in the dispatch path using `[MemoryDiagnoser]`
-- **Concurrency:** Property tests for RPC correlation run with high parallelism to stress concurrent access
-
