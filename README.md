@@ -1,74 +1,58 @@
 # MqCSFramework
 
-A lightweight, broker-agnostic message queue framework for .NET 10.
+A lightweight RabbitMQ messaging framework for .NET 10 with compile-time type safety.
 
 ## Features
 
-- **Broker-agnostic abstractions** — swap transports without changing application code
 - **Two messaging patterns**: Standard (fire-and-forget) and RPC (request-reply)
-- **Two transport implementations**: RabbitMQ and In-Memory (for testing)
-- **Processor-linked routing** — compile-time safety between sender and consumer
-- **Independent connections per sender/consumer** — connect to multiple brokers from one service
-- **Built-in health checks** and OpenTelemetry tracing
-- **Pluggable serialization** (System.Text.Json default)
-- **Modern .NET 10** — async/await, nullable, keyed DI services
-
-## Package Structure
-
-| Package | Purpose |
-|---------|---------|
-| `MqCSFramework.Abstractions` | Interfaces, models, base classes (no broker dependency) |
-| `MqCSFramework.RabbitMQ` | RabbitMQ transport implementation |
-| `MqCSFramework.InMemory` | In-memory transport for testing/development |
-| `MqCSFramework.Hosting` | BackgroundService, DI extensions, health checks |
+- **Compile-time safety** — generic constraints ensure message types match processor expectations
+- **Zero-reflection dispatch** — processors resolved from DI, called via non-generic interface
+- **Independent connections** — each sender/consumer has its own RabbitMQ connection
+- **One-line configuration** — `builder.Services.AddMqCSFramework(builder.Configuration)`
+- **Automatic retry + dead-letter** — configurable retry count with error queue routing
+- **Structured logging** — Serilog with configurable sensitive field masking
 
 ## Quick Start
 
 ```csharp
-// Sender service
-builder.Services.AddMqCSFramework(mq =>
-{
-    mq.AddSender("orders", opts =>
-    {
-        builder.Configuration.GetSection("MqCSFramework:Senders:orders").Bind(opts);
-    });
-});
+// Define contracts (shared project)
+public record OrderMessage(Guid OrderId, string Customer, decimal Amount);
+public interface IOrderProcessor : IMessageProcessor<OrderMessage>;
 
-// Inject and use
-public class OrderService([FromKeyedServices("orders")] IMessageSender sender)
+// Implement processor (consumer project)
+public class OrderProcessor : StandardProcessor<OrderMessage>, IOrderProcessor
 {
-    public async Task PlaceOrderAsync(OrderPlaced order)
+    public override Task ProcessAsync(OrderMessage msg, MessageContext ctx, CancellationToken ct)
     {
-        await sender.SendAsync<OrderPlacedProcessor>(order);
+        Console.WriteLine($"Processing order {msg.OrderId}");
+        return Task.CompletedTask;
     }
 }
+
+// Consumer setup
+builder.Services.AddSingleton<IOrderProcessor, OrderProcessor>();
+builder.Services.AddMqCSFramework(builder.Configuration);
+
+// Sender setup
+builder.Services.AddMqCSFramework(builder.Configuration);
+var sender = app.Services.GetRequiredKeyedService<IStandardSender>("orders");
+await sender.SendAsync<IOrderProcessor, OrderMessage>(new OrderMessage(...));
 ```
 
-```csharp
-// Consumer service
-builder.Services.AddMqCSFramework(mq =>
-{
-    mq.AddConsumer("orders", opts =>
-    {
-        builder.Configuration.GetSection("MqCSFramework:Consumers:orders").Bind(opts);
-    });
-    mq.AddProcessor<OrderPlacedProcessor, OrderPlaced>();
-});
+## Documentation
 
-// Processor implementation
-public class OrderPlacedProcessor : IMessageProcessor<OrderPlaced>
-{
-    public async Task ProcessAsync(OrderPlaced message, MessageContext context, CancellationToken ct)
-    {
-        // Handle the order...
-    }
-}
-```
+| Document | Description |
+|----------|-------------|
+| [Overview](docs/overview.md) | Architecture, use cases, how it works |
+| [Quick Start](docs/quickstart.md) | Get running in 5 minutes |
+| [Configuration](docs/configuration.md) | All options and appsettings.json reference |
+| [API Reference](docs/api-reference.md) | Interfaces, classes, methods |
+| [Samples](docs/samples.md) | Running included samples + build your own |
 
 ## Requirements
 
 - .NET 10 SDK
-- RabbitMQ (for the RabbitMQ transport — not needed with InMemory transport)
+- RabbitMQ instance
 
 ## License
 
