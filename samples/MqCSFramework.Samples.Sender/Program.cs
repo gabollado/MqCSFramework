@@ -2,44 +2,15 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using MqCSFramework;
 using MqCSFramework.Samples.Contracts;
+using Serilog;
 
 var builder = Host.CreateApplicationBuilder(args);
 
-builder.Services.AddMqCSFramework(mq =>
-{
-    mq.AddSender("orders", opts =>
-    {
-        opts.Connection = new RabbitMqConnectionOptions
-        {
-            HostName = "dog.lmq.cloudamqp.com",
-            Port = 5671,
-            UserName = "mqxiamut",
-            Password = "AcTKNeRmStLhDriJM5mwC3Ok13JgUzOJ",
-            VirtualHost = "mqxiamut",
-            UseSsl = true,
-            ClientProvidedName = "sample-sender-orders"
-        };
-        opts.Exchange = "";
-        opts.RoutingKey = "orders-queue";
-    });
+// Configure Serilog from appsettings.json
+builder.Services.AddSerilog(config => config.ReadFrom.Configuration(builder.Configuration));
 
-    mq.AddRpcSender("stock", opts =>
-    {
-        opts.Connection = new RabbitMqConnectionOptions
-        {
-            HostName = "dog.lmq.cloudamqp.com",
-            Port = 5671,
-            UserName = "mqxiamut",
-            Password = "AcTKNeRmStLhDriJM5mwC3Ok13JgUzOJ",
-            VirtualHost = "mqxiamut",
-            UseSsl = true,
-            ClientProvidedName = "sample-sender-stock"
-        };
-        opts.Exchange = "";
-        opts.RoutingKey = "stock-queue";
-        opts.Timeout = TimeSpan.FromSeconds(10);
-    });
-});
+// Configure MqCSFramework — one line, reads everything from "MqCSFramework" section
+builder.Services.AddMqCSFramework(builder.Configuration);
 
 var app = builder.Build();
 

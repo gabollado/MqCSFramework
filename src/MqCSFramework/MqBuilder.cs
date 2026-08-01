@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -28,7 +29,7 @@ public sealed class MqBuilder
 
         var options = new StandardSenderOptions
         {
-            Connection = new RabbitMqConnectionOptions { HostName = "localhost" },
+            Connection = new(),
             Exchange = ""
         };
         configure(options);
@@ -53,7 +54,7 @@ public sealed class MqBuilder
 
         var options = new RpcSenderOptions
         {
-            Connection = new RabbitMqConnectionOptions { HostName = "localhost" },
+            Connection = new(),
             Exchange = ""
         };
         configure(options);
@@ -78,12 +79,39 @@ public sealed class MqBuilder
 
         var options = new ConsumerOptions
         {
-            Connection = new RabbitMqConnectionOptions { HostName = "localhost" },
+            Connection = new(),
             QueueName = ""
         };
         configure(options);
 
         _consumers.Add(new ConsumerRegistration(name, options));
+        return this;
+    }
+
+    /// <summary>
+    /// Auto-registers all senders, RPC senders, and consumers from the given config section.
+    /// Reads "Senders", "RpcSenders", and "Consumers" sub-sections.
+    /// Each key becomes the keyed service name, values bind to the corresponding options class.
+    /// </summary>
+    public MqBuilder BindConfiguration(IConfigurationSection section)
+    {
+        ArgumentNullException.ThrowIfNull(section);
+
+        foreach (var child in section.GetSection("Senders").GetChildren())
+        {
+            AddSender(child.Key, opts => child.Bind(opts));
+        }
+
+        foreach (var child in section.GetSection("RpcSenders").GetChildren())
+        {
+            AddRpcSender(child.Key, opts => child.Bind(opts));
+        }
+
+        foreach (var child in section.GetSection("Consumers").GetChildren())
+        {
+            AddConsumer(child.Key, opts => child.Bind(opts));
+        }
+
         return this;
     }
 

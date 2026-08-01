@@ -337,6 +337,9 @@ namespace MqCSFramework;
 
 public static class ServiceCollectionExtensions
 {
+    /// <summary>
+    /// Registers MqCSFramework with manual builder configuration.
+    /// </summary>
     public static IServiceCollection AddMqCSFramework(
         this IServiceCollection services,
         Action<MqBuilder> configure)
@@ -345,6 +348,30 @@ public static class ServiceCollectionExtensions
         configure(builder);
         builder.Build();
         return services;
+    }
+
+    /// <summary>
+    /// Registers MqCSFramework auto-binding from the "MqCSFramework" config section.
+    /// </summary>
+    public static IServiceCollection AddMqCSFramework(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        return services.AddMqCSFramework(configuration, "MqCSFramework");
+    }
+
+    /// <summary>
+    /// Registers MqCSFramework auto-binding from the specified config section name.
+    /// </summary>
+    public static IServiceCollection AddMqCSFramework(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        string sectionName)
+    {
+        return services.AddMqCSFramework(mq =>
+        {
+            mq.BindConfiguration(configuration.GetSection(sectionName));
+        });
     }
 }
 
@@ -372,6 +399,25 @@ public sealed class MqBuilder
     public MqBuilder AddConsumer(string name, Action<ConsumerOptions> configure)
     {
         // Registers consumer configuration; actual hosting via BackgroundService
+        return this;
+    }
+
+    /// <summary>
+    /// Auto-registers all senders, RPC senders, and consumers from the given config section.
+    /// Reads "Senders", "RpcSenders", and "Consumers" sub-sections.
+    /// Each key becomes the keyed service name, values bind to the corresponding options class.
+    /// </summary>
+    public MqBuilder BindConfiguration(IConfigurationSection section)
+    {
+        foreach (var child in section.GetSection("Senders").GetChildren())
+            AddSender(child.Key, opts => child.Bind(opts));
+
+        foreach (var child in section.GetSection("RpcSenders").GetChildren())
+            AddRpcSender(child.Key, opts => child.Bind(opts));
+
+        foreach (var child in section.GetSection("Consumers").GetChildren())
+            AddConsumer(child.Key, opts => child.Bind(opts));
+
         return this;
     }
 
@@ -1103,32 +1149,64 @@ public class StockProcessor(ILogger<StockProcessor> logger) : RpcProcessor<Stock
 
 ### appsettings.json Configuration Example
 
+Sample projects read all configuration from `appsettings.json`. Connection credentials, queue names, and logging settings are never hardcoded.
+
 ```json
 {
+  "Serilog": {
+    "Using": ["Serilog.Sinks.Console", "Serilog.Sinks.File"],
+    "MinimumLevel": "Information",
+    "WriteTo": [
+      { "Name": "Console" },
+      {
+        "Name": "File",
+        "Args": {
+          "path": "C:\\Logging\\mqcsframework-.log",
+          "rollingInterval": "Day"
+        }
+      }
+    ]
+  },
   "MqCSFramework": {
     "Senders": {
       "orders": {
         "Connection": {
-          "HostName": "rabbitmq.prod.internal",
-          "Port": 5672,
-          "UserName": "app-sender",
-          "Password": "secret",
-          "VirtualHost": "/production",
+          "HostName": "dog.lmq.cloudamqp.com",
+          "Port": 5671,
+          "UserName": "mqxiamut",
+          "Password": "AcTKNeRmStLhDriJM5mwC3Ok13JgUzOJ",
+          "VirtualHost": "mqxiamut",
           "UseSsl": true,
           "ClientProvidedName": "order-service-sender"
         },
-        "Exchange": "orders-exchange",
-        "RoutingKey": "orders.new"
+        "Exchange": "",
+        "RoutingKey": "orders-queue"
+      }
+    },
+    "RpcSenders": {
+      "stock": {
+        "Connection": {
+          "HostName": "dog.lmq.cloudamqp.com",
+          "Port": 5671,
+          "UserName": "mqxiamut",
+          "Password": "AcTKNeRmStLhDriJM5mwC3Ok13JgUzOJ",
+          "VirtualHost": "mqxiamut",
+          "UseSsl": true,
+          "ClientProvidedName": "stock-service-rpc-sender"
+        },
+        "Exchange": "",
+        "RoutingKey": "stock-queue",
+        "Timeout": "00:00:10"
       }
     },
     "Consumers": {
       "orders": {
         "Connection": {
-          "HostName": "rabbitmq.prod.internal",
-          "Port": 5672,
-          "UserName": "app-consumer",
-          "Password": "secret",
-          "VirtualHost": "/production",
+          "HostName": "dog.lmq.cloudamqp.com",
+          "Port": 5671,
+          "UserName": "mqxiamut",
+          "Password": "AcTKNeRmStLhDriJM5mwC3Ok13JgUzOJ",
+          "VirtualHost": "mqxiamut",
           "UseSsl": true,
           "ClientProvidedName": "order-service-consumer"
         },
@@ -1137,7 +1215,7 @@ public class StockProcessor(ILogger<StockProcessor> logger) : RpcProcessor<Stock
         "MaxRetries": 5,
         "DeadLetterExchange": "orders-dlx",
         "DeadLetterRoutingKey": "orders.dead",
-        "SuppressMessageBodyLogging": true,
+        "SuppressMessageBodyLogging": false,
         "MaskedFields": ["password", "token", "creditCardNumber"]
       }
     }

@@ -84,12 +84,15 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 
 #### Acceptance Criteria
 
-1. Extension method `AddMqCSFramework(mq => { ... })` registers framework services
-2. `mq.AddSender("name", opts => { ... })` registers a keyed `IMessageSender`
-3. `mq.AddRpcSender("name", opts => { ... })` registers a keyed `IRpcSender`
-4. `mq.AddConsumer("name", opts => { ... })` registers a consumer
-5. Senders are injected via `[FromKeyedServices("name")] IMessageSender sender`
-6. Configuration binds from `IConfiguration` (appsettings.json)
+1. Extension method `AddMqCSFramework(mq => { ... })` registers framework services with manual configuration
+2. Extension method `AddMqCSFramework(IConfiguration)` auto-binds from config section `"MqCSFramework"`
+3. Extension method `AddMqCSFramework(IConfiguration, "SectionName")` auto-binds from the specified config section
+4. `mq.AddSender("name", opts => { ... })` registers a keyed `IStandardSender`
+5. `mq.AddRpcSender("name", opts => { ... })` registers a keyed `IRpcSender`
+6. `mq.AddConsumer("name", opts => { ... })` registers a consumer
+7. `mq.BindConfiguration(IConfigurationSection)` auto-registers all senders/rpcSenders/consumers from config sections
+8. Senders are injected via `[FromKeyedServices("name")] IStandardSender sender`
+9. Configuration binds from `IConfiguration` (appsettings.json)
 
 ### Requirement 6: Consumer Hosting
 
@@ -116,10 +119,12 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 
 #### Acceptance Criteria
 
-1. All log messages use `ILogger`
-2. Correlation IDs are logged throughout the pipeline
-3. Option to suppress message body logging
-4. Sensitive field masking (configurable list of field names replaced with `***MASKED***`)
+1. All log messages use `ILogger` via Serilog
+2. Sample projects configure Serilog with file sink writing to `C:\Logging\` directory
+3. Correlation IDs are logged throughout the pipeline
+4. Option to suppress message body logging
+5. Sensitive field masking (configurable list of field names replaced with `***MASKED***`)
+6. Configuration (connection details, queue names, etc.) is read from `appsettings.json` — not hardcoded
 
 ### Requirement 9: Error Handling
 

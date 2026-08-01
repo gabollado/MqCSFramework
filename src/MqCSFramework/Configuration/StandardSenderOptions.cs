@@ -5,7 +5,7 @@ namespace MqCSFramework;
 /// </summary>
 public sealed class StandardSenderOptions
 {
-    public required RabbitMqConnectionOptions Connection { get; set; }
-    public required string Exchange { get; set; }
+    public RabbitMqConnectionOptions Connection { get; set; } = new();
+    public string Exchange { get; set; } = "";
     public string RoutingKey { get; set; } = "";
 }

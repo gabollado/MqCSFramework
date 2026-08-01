@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace MqCSFramework;
@@ -8,7 +9,7 @@ namespace MqCSFramework;
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Adds MqCSFramework services to the DI container.
+    /// Adds MqCSFramework services with manual builder configuration.
     /// </summary>
     public static IServiceCollection AddMqCSFramework(
         this IServiceCollection services,
@@ -22,5 +23,32 @@ public static class ServiceCollectionExtensions
         builder.Build();
 
         return services;
+    }
+
+    /// <summary>
+    /// Adds MqCSFramework services auto-binding from the "MqCSFramework" config section.
+    /// </summary>
+    public static IServiceCollection AddMqCSFramework(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        return services.AddMqCSFramework(configuration, "MqCSFramework");
+    }
+
+    /// <summary>
+    /// Adds MqCSFramework services auto-binding from the specified config section name.
+    /// </summary>
+    public static IServiceCollection AddMqCSFramework(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        string sectionName)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sectionName);
+
+        return services.AddMqCSFramework(mq =>
+        {
+            mq.BindConfiguration(configuration.GetSection(sectionName));
+        });
     }
 }
