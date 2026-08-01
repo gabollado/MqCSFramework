@@ -1,4 +1,9 @@
 <Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/MqCSFramework.Samples.Consumer/MqCSFramework.Samples.Consumer.csproj" />
+    <Project Path="samples/MqCSFramework.Samples.Contracts/MqCSFramework.Samples.Contracts.csproj" />
+    <Project Path="samples/MqCSFramework.Samples.Sender/MqCSFramework.Samples.Sender.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/MqCSFramework/MqCSFramework.csproj" />
   </Folder>

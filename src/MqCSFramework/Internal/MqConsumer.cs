@@ -35,6 +35,15 @@ internal sealed class MqConsumer : IAsyncDisposable
         _connection = new RabbitMqConnection(_options.Connection, _logger);
         _channel = await _connection.GetChannelAsync(ct);
 
+        // Declare queue (idempotent — creates if not exists, no-op if already exists)
+        await _channel.QueueDeclareAsync(
+            queue: _options.QueueName,
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: null,
+            cancellationToken: ct);
+
         await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: _options.PrefetchCount, global: false, cancellationToken: ct);
 
         var consumer = new AsyncEventingBasicConsumer(_channel);
@@ -267,11 +276,10 @@ internal sealed class MqConsumer : IAsyncDisposable
 
         var bodyString = Encoding.UTF8.GetString(ea.Body.Span);
 
-        // TODO: Full masking will be implemented in task 8.1 via LogMaskingHelper.
-        // For now, log the body as-is when no masking is configured, or note it's masked.
         if (_maskedFields is not null && _maskedFields.Count > 0)
         {
-            _logger.LogDebug("Message {MessageId} body: [contains masked fields — masking pending task 8.1]", messageId);
+            var maskedBody = LogMaskingHelper.Mask(bodyString, _maskedFields);
+            _logger.LogDebug("Message {MessageId} body: {Body}", messageId, maskedBody);
         }
         else
         {

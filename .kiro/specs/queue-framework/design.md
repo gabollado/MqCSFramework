@@ -403,10 +403,11 @@ internal sealed class MqConsumer : IAsyncDisposable
     {
         // 1. Create connection via ConnectionFactory.CreateConnectionAsync()
         // 2. Create channel via connection.CreateChannelAsync()
-        // 3. Set prefetch: channel.BasicQosAsync(prefetchCount)
-        // 4. Register AsyncEventingBasicConsumer
-        // 5. consumer.ReceivedAsync += DispatchMessage
-        // 6. channel.BasicConsumeAsync(queueName, autoAck: false, consumer)
+        // 3. Declare queue (idempotent): channel.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false)
+        // 4. Set prefetch: channel.BasicQosAsync(prefetchCount)
+        // 5. Register AsyncEventingBasicConsumer
+        // 6. consumer.ReceivedAsync += DispatchMessage
+        // 7. channel.BasicConsumeAsync(queueName, autoAck: false, consumer)
     }
 
     private async Task DispatchMessage(object sender, BasicDeliverEventArgs ea)
