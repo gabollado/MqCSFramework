@@ -11,4 +11,5 @@ public static class MqHeaders
 
     public const string PatternStandard = "standard";
     public const string PatternRpc = "rpc";
+    public const string CancellationDeadline = "mq-cancellation-deadline";
 }

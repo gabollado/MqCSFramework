@@ -9,8 +9,8 @@ public sealed class ConsumerOptions
     public string QueueName { get; set; } = "";
     public ushort PrefetchCount { get; set; } = 10;
     public int MaxRetries { get; set; } = 3;
+    public int ProcessingTimeoutMs { get; set; } = 30000;
     public string? DeadLetterExchange { get; set; }
     public string? DeadLetterRoutingKey { get; set; }
-    public bool SuppressMessageBodyLogging { get; set; }
     public IReadOnlyList<string> MaskedFields { get; set; } = [];
 }

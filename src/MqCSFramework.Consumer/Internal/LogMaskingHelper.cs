@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
-namespace MqCSFramework.Internal;
+namespace MqCSFramework.Consumer.Internal;
 
 /// <summary>
 /// Masks sensitive field values in JSON strings for logging purposes.

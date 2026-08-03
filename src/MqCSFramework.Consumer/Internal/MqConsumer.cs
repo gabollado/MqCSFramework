@@ -1,10 +1,11 @@
+using MqCSFramework.Internal;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
-namespace MqCSFramework.Internal;
+namespace MqCSFramework.Consumer.Internal;
 
 /// <summary>
 /// Manages a single consumer — owns its connection, channel, and message dispatch loop.
@@ -64,10 +65,19 @@ internal sealed class MqConsumer : IAsyncDisposable
         var messageId = ea.BasicProperties?.MessageId ?? "unknown";
         var correlationId = ea.BasicProperties?.CorrelationId ?? messageId;
 
+        // Wrap all processing in a logging scope so every log entry includes CorrelationId
+        using (_logger.CorrelationScope(correlationId))
+        {
+            await DispatchMessageCoreAsync(ea, messageId, correlationId);
+        }
+    }
+
+    private async Task DispatchMessageCoreAsync(BasicDeliverEventArgs ea, string messageId, string correlationId)
+    {
         try
         {
             // 1. Read mq-processor-type header
-            var processorTypeName = GetHeaderString(ea, MqHeaders.ProcessorType);
+            var processorTypeName = MessageHelpers.GetHeaderString(ea, MqHeaders.ProcessorType);
             if (processorTypeName is null)
             {
                 _logger.LogWarning("Message {MessageId} missing '{Header}' header. NACK without requeue.",
@@ -97,7 +107,7 @@ internal sealed class MqConsumer : IAsyncDisposable
             }
 
             // 4. Determine pattern
-            var pattern = GetHeaderString(ea, MqHeaders.Pattern);
+            var pattern = MessageHelpers.GetHeaderString(ea, MqHeaders.Pattern);
             if (pattern is null)
             {
                 _logger.LogWarning("Message {MessageId} missing '{Header}' header. NACK without requeue.",
@@ -109,7 +119,7 @@ internal sealed class MqConsumer : IAsyncDisposable
             // 5. Log message body (masked or suppressed)
             LogMessageBody(ea, messageId);
 
-            var context = BuildContext(ea, messageId, correlationId, pattern);
+            var context = MessageHelpers.BuildContext(ea, messageId, correlationId, pattern);
 
             // 6. Dispatch based on pattern
             if (pattern == MqHeaders.PatternRpc)
@@ -146,7 +156,7 @@ internal sealed class MqConsumer : IAsyncDisposable
             return;
         }
 
-        await standardProcessor.ProcessRawAsync(ea.Body, context, CancellationToken.None);
+        await standardProcessor.ProcessRawAsync(ea.Body, context, CreateStandardTimeoutToken());
 
         await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
         _logger.LogInformation("Message {MessageId} processed successfully by {Processor}. ACK.",
@@ -166,7 +176,7 @@ internal sealed class MqConsumer : IAsyncDisposable
         RpcResponseEnvelope envelope;
         try
         {
-            var responseBytes = await rpcProcessor.ProcessRawRpcAsync(ea.Body, context, CancellationToken.None);
+            var responseBytes = await rpcProcessor.ProcessRawRpcAsync(ea.Body, context, CreateRpcTimeoutToken(ea));
             envelope = new RpcResponseEnvelope { IsError = false, Payload = responseBytes };
         }
         catch (Exception ex)
@@ -202,11 +212,10 @@ internal sealed class MqConsumer : IAsyncDisposable
 
     private async Task HandleFailureAsync(BasicDeliverEventArgs ea, string messageId)
     {
-        var retryCount = GetRetryCount(ea);
+        var retryCount = MessageHelpers.GetRetryCount(ea);
 
         if (_options.MaxRetries > 0 && retryCount >= _options.MaxRetries)
         {
-            // Dead-letter: publish to DLX if configured, then ACK original
             if (!string.IsNullOrEmpty(_options.DeadLetterExchange))
             {
                 _logger.LogWarning("Message {MessageId} exceeded max retries ({MaxRetries}). Routing to dead-letter.",
@@ -228,84 +237,83 @@ internal sealed class MqConsumer : IAsyncDisposable
                     false, dlProps, ea.Body, CancellationToken.None);
 
                 await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                return;
             }
-            else
-            {
-                // No DLX configured — NACK without requeue
-                await NackWithoutRequeueAsync(ea);
-            }
+
+            await NackWithoutRequeueAsync(ea);
+            return;
         }
-        else
+
+        // Retry: republish with incremented retry header and ACK the original
+        var headers = ea.BasicProperties?.Headers != null
+            ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
+            : new Dictionary<string, object?>();
+        headers[MqHeaders.RetryCount] = retryCount + 1;
+
+        var retryProps = new BasicProperties
         {
-            // NACK with requeue — increment retry header
-            // Note: RabbitMQ's built-in NACK+requeue doesn't allow modifying headers on the same message,
-            // so we republish with updated header and ACK the original
-            var headers = ea.BasicProperties?.Headers != null
-                ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
-                : new Dictionary<string, object?>();
-            headers[MqHeaders.RetryCount] = retryCount + 1;
+            MessageId = ea.BasicProperties?.MessageId,
+            CorrelationId = ea.BasicProperties?.CorrelationId,
+            Timestamp = ea.BasicProperties?.Timestamp ?? new AmqpTimestamp(0),
+            ContentType = ea.BasicProperties?.ContentType,
+            ReplyTo = ea.BasicProperties?.ReplyTo,
+            Headers = headers
+        };
 
-            var retryProps = new BasicProperties
-            {
-                MessageId = ea.BasicProperties?.MessageId,
-                CorrelationId = ea.BasicProperties?.CorrelationId,
-                Timestamp = ea.BasicProperties?.Timestamp ?? new AmqpTimestamp(0),
-                ContentType = ea.BasicProperties?.ContentType,
-                ReplyTo = ea.BasicProperties?.ReplyTo,
-                Headers = headers
-            };
+        await _channel!.BasicPublishAsync(
+            ea.Exchange ?? "",
+            ea.RoutingKey,
+            false, retryProps, ea.Body, CancellationToken.None);
 
-            await _channel!.BasicPublishAsync(
-                ea.Exchange ?? "",
-                ea.RoutingKey,
-                false, retryProps, ea.Body, CancellationToken.None);
+        await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
 
-            await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
-
-            _logger.LogWarning("Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued.",
-                messageId, retryCount + 1, _options.MaxRetries);
-        }
+        _logger.LogWarning("Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued.",
+            messageId, retryCount + 1, _options.MaxRetries);
     }
 
     private void LogMessageBody(BasicDeliverEventArgs ea, string messageId)
     {
-        if (_options.SuppressMessageBodyLogging)
-        {
-            return;
-        }
-
         var bodyString = Encoding.UTF8.GetString(ea.Body.Span);
 
         if (_maskedFields is not null && _maskedFields.Count > 0)
         {
-            var maskedBody = LogMaskingHelper.Mask(bodyString, _maskedFields);
-            _logger.LogDebug("Message {MessageId} body: {Body}", messageId, maskedBody);
+            _logger.LogDebug("Message {MessageId} body: {Body}", messageId, LogMaskingHelper.Mask(bodyString, _maskedFields));
+            return;
         }
-        else
-        {
-            _logger.LogDebug("Message {MessageId} body: {Body}", messageId, bodyString);
-        }
+
+        _logger.LogDebug("Message {MessageId} body: {Body}", messageId, bodyString);
     }
 
-    private static int GetRetryCount(BasicDeliverEventArgs ea)
+    private CancellationToken CreateStandardTimeoutToken()
     {
-        if (ea.BasicProperties?.Headers is null)
+        if (_options.ProcessingTimeoutMs <= 0)
         {
-            return 0;
+            return CancellationToken.None;
         }
 
-        if (!ea.BasicProperties.Headers.TryGetValue(MqHeaders.RetryCount, out var value))
+        var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(_options.ProcessingTimeoutMs));
+        return cts.Token;
+    }
+
+    private CancellationToken CreateRpcTimeoutToken(BasicDeliverEventArgs ea)
+    {
+        var deadlineStr = MessageHelpers.GetHeaderString(ea, MqHeaders.CancellationDeadline);
+        if (deadlineStr is null || !long.TryParse(deadlineStr, out var deadlineTicks))
         {
-            return 0;
+            return CancellationToken.None;
         }
 
-        return value switch
+        var deadline = new DateTimeOffset(deadlineTicks, TimeSpan.Zero);
+        var remaining = deadline - DateTimeOffset.UtcNow;
+
+        if (remaining <= TimeSpan.Zero)
         {
-            int i => i,
-            long l => (int)l,
-            byte[] bytes => int.TryParse(Encoding.UTF8.GetString(bytes), out var parsed) ? parsed : 0,
-            _ => 0
-        };
+            // Already expired — cancel immediately
+            return new CancellationToken(canceled: true);
+        }
+
+        var cts = new CancellationTokenSource(remaining);
+        return cts.Token;
     }
 
     private async Task NackWithoutRequeueAsync(BasicDeliverEventArgs ea)
@@ -316,56 +324,6 @@ internal sealed class MqConsumer : IAsyncDisposable
         }
     }
 
-    private static string? GetHeaderString(BasicDeliverEventArgs ea, string headerName)
-    {
-        if (ea.BasicProperties?.Headers is null)
-        {
-            return null;
-        }
-
-        if (!ea.BasicProperties.Headers.TryGetValue(headerName, out var value))
-        {
-            return null;
-        }
-
-        return value switch
-        {
-            byte[] bytes => Encoding.UTF8.GetString(bytes),
-            string s => s,
-            _ => value?.ToString()
-        };
-    }
-
-    private static MessageContext BuildContext(BasicDeliverEventArgs ea, string messageId, string correlationId, string pattern)
-    {
-        var headers = new Dictionary<string, string>();
-        if (ea.BasicProperties?.Headers is not null)
-        {
-            foreach (var kvp in ea.BasicProperties.Headers)
-            {
-                var val = kvp.Value switch
-                {
-                    byte[] bytes => Encoding.UTF8.GetString(bytes),
-                    _ => kvp.Value?.ToString() ?? ""
-                };
-                headers[kvp.Key] = val;
-            }
-        }
-
-        var timestamp = ea.BasicProperties?.Timestamp.UnixTime > 0
-            ? DateTimeOffset.FromUnixTimeSeconds(ea.BasicProperties.Timestamp.UnixTime)
-            : DateTimeOffset.UtcNow;
-
-        return new MessageContext
-        {
-            MessageId = messageId,
-            CorrelationId = correlationId,
-            Timestamp = timestamp,
-            Pattern = pattern,
-            Headers = headers
-        };
-    }
-
     public async ValueTask DisposeAsync()
     {
         if (_connection is not null)
@@ -374,3 +332,4 @@ internal sealed class MqConsumer : IAsyncDisposable
         }
     }
 }
+

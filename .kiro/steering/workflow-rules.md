@@ -18,7 +18,7 @@ This rule exists because the developer WILL delete all code and regenerate from 
 ## Project-Specific Rules
 
 - The project uses RabbitMQ only — no transport abstraction layer
-- Single NuGet package: `MqCSFramework`
+- Three NuGet packages: `MqCSFramework` (core/shared), `MqCSFramework.Sender`, `MqCSFramework.Consumer`
 - Processors are registered as standard DI singletons by the developer
 - Processor implementations inherit from abstract base classes (`StandardProcessor<T>`, `RpcProcessor<TReq, TRes>`) which handle deserialization internally
 - Consumer dispatch uses non-generic base interfaces (`IMessageProcessor.ProcessRawAsync`, `IRpcProcessor.ProcessRawRpcAsync`) — no reflection, no separate dispatch interfaces
@@ -26,3 +26,4 @@ This rule exists because the developer WILL delete all code and regenerate from 
 - Each sender/consumer has its own independent RabbitMQ connection
 - Two sender interfaces: `IStandardSender` and `IRpcSender`
 - All references to the company (xximo, XXImo) must be excluded from the project
+- Prefer early returns over if/else chains — if a branch ends with return, throw, or exits, don't use else

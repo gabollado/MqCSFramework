@@ -1,7 +1,7 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
-namespace MqCSFramework.Internal;
+namespace MqCSFramework.Consumer.Internal;
 
 /// <summary>
 /// BackgroundService that starts and manages all registered consumers.
@@ -15,12 +15,12 @@ internal sealed class ConsumerHostedService : BackgroundService
     private readonly List<MqConsumer> _consumers = [];
 
     public ConsumerHostedService(
-        IReadOnlyList<ConsumerRegistration> registrations,
+        IEnumerable<ConsumerRegistration> registrations,
         IServiceProvider serviceProvider,
         ILoggerFactory loggerFactory,
         ILogger<ConsumerHostedService> logger)
     {
-        _registrations = registrations;
+        _registrations = registrations.ToList();
         _serviceProvider = serviceProvider;
         _loggerFactory = loggerFactory;
         _logger = logger;

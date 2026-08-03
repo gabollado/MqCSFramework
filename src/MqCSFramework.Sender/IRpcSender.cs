@@ -8,6 +8,7 @@ public interface IRpcSender
 {
     Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(
         TRequest request,
+        string correlationId,
         RpcOptions? options = null,
         CancellationToken ct = default)
         where TProcessor : IRpcProcessor<TRequest, TResponse>

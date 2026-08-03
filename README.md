@@ -1,6 +1,8 @@
 # MqCSFramework
 
-A lightweight RabbitMQ messaging framework for .NET 10 with compile-time type safety.
+A .NET 10 framework for building client/server communication through centralized message queues using RabbitMQ.
+
+MqCSFramework simplifies service-to-service messaging by providing a type-safe, compile-time-checked API for sending and consuming messages through a central bus. Services communicate via queues rather than direct HTTP calls — decoupling producers from consumers, enabling independent scaling, and providing built-in resilience through message persistence and retry mechanisms.
 
 ## Features
 

@@ -1,9 +1,10 @@
+using MqCSFramework.Internal;
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
-namespace MqCSFramework.Internal;
+namespace MqCSFramework.Sender.Internal;
 
 /// <summary>
 /// Manages the reply queue consumer for RPC responses.
@@ -139,3 +140,4 @@ internal sealed class RpcRequestResponseHandler : IDisposable
         _initLock.Dispose();
     }
 }
+

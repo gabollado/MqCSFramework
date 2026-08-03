@@ -8,6 +8,7 @@ public interface IStandardSender
 {
     Task<string> SendAsync<TProcessor, TMessage>(
         TMessage message,
+        string correlationId,
         SendOptions? options = null,
         CancellationToken ct = default)
         where TProcessor : IMessageProcessor<TMessage>

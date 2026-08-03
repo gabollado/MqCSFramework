@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\MqCSFramework.Samples.Contracts\MqCSFramework.Samples.Contracts.csproj" />
     <ProjectReference Include="..\..\src\MqCSFramework\MqCSFramework.csproj" />
+    <ProjectReference Include="..\..\src\MqCSFramework.Sender\MqCSFramework.Sender.csproj" />
   </ItemGroup>
 
   <ItemGroup>

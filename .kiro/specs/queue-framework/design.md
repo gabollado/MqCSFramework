@@ -214,6 +214,7 @@ public interface IStandardSender
 {
     Task<string> SendAsync<TProcessor, TMessage>(
         TMessage message,
+        string correlationId,
         SendOptions? options = null,
         CancellationToken ct = default)
         where TProcessor : IMessageProcessor<TMessage>
@@ -227,6 +228,7 @@ public interface IRpcSender
 {
     Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(
         TRequest request,
+        string correlationId,
         RpcOptions? options = null,
         CancellationToken ct = default)
         where TProcessor : IRpcProcessor<TRequest, TResponse>
@@ -314,7 +316,6 @@ public sealed class ConsumerOptions
 public sealed class SendOptions
 {
     public string? RoutingKey { get; set; }
-    public string? CorrelationId { get; set; }
     public IReadOnlyDictionary<string, string>? AdditionalHeaders { get; set; }
 }
 
@@ -324,7 +325,6 @@ public sealed class SendOptions
 public sealed class RpcOptions
 {
     public string? RoutingKey { get; set; }
-    public string? CorrelationId { get; set; }
     public TimeSpan? Timeout { get; set; }
     public IReadOnlyDictionary<string, string>? AdditionalHeaders { get; set; }
 }
@@ -461,11 +461,16 @@ internal sealed class MqConsumer : IAsyncDisposable
         // 1. Read mq-processor-type header → Type.GetType(value)
         // 2. Read mq-pattern header ("standard" or "rpc")
         // 3. Resolve processor from DI: _serviceProvider.GetService(processorType)
-        // 4. If standard: cast to IMessageProcessor (non-generic) → call ProcessRawAsync(body, context, ct)
-        //    The base class (StandardProcessor<T>) deserializes and calls typed ProcessAsync
-        // 5. If RPC: cast to IRpcProcessor (non-generic) → call ProcessRawRpcAsync(body, context, ct)
-        //    The base class (RpcProcessor<TReq, TRes>) deserializes, calls ProcessAsync, serializes response
-        // 6. On success: ACK. On failure: retry logic (increment mq-retry-count, dead-letter if exceeded)
+        // 4. Begin a Serilog LogContext scope with CorrelationId so ALL log entries during
+        //    this message's processing include the correlation ID automatically:
+        //    using (_logger.BeginScope(new Dictionary<string, object> { ["CorrelationId"] = correlationId }))
+        //    With Serilog's Enrich.FromLogContext() and {CorrelationId} in the output template,
+        //    the correlation ID appears in every log line without explicitly passing it.
+        // 5. If standard: cast to IMessageProcessor (non-generic) → call ProcessRawAsync(body, context, ct)
+        //    CancellationToken created from ConsumerOptions.ProcessingTimeoutMs
+        // 6. If RPC: cast to IRpcProcessor (non-generic) → call ProcessRawRpcAsync(body, context, ct)
+        //    CancellationToken created from mq-cancellation-deadline header (remaining time until deadline)
+        // 7. On success: ACK. On failure: retry logic (increment mq-retry-count, dead-letter if exceeded)
         // NO REFLECTION — dispatch is a simple interface cast + method call
     }
 
@@ -510,6 +515,25 @@ public static class MqHeaders
 
     public const string PatternStandard = "standard";
     public const string PatternRpc = "rpc";
+    public const string CancellationDeadline = "mq-cancellation-deadline"; // UTC ticks when the request expires
+}
+```
+
+### Correlation ID Logging Scope
+
+```csharp
+namespace MqCSFramework;
+
+/// <summary>
+/// Extension method to simplify creating a logging scope with a CorrelationId.
+/// Usage: using (logger.CorrelationScope(correlationId)) { ... }
+/// </summary>
+public static class LoggingExtensions
+{
+    public static IDisposable? CorrelationScope(this ILogger logger, string correlationId)
+    {
+        return logger.BeginScope(new Dictionary<string, object> { ["CorrelationId"] = correlationId });
+    }
 }
 ```
 
@@ -913,37 +937,55 @@ flowchart TD
 
 ### Source Project Structure
 
+Three packages with clear dependency direction:
+
 ```
-src/MqCSFramework/
-  Configuration/              ← Options classes
+MqCSFramework.Sender ──► MqCSFramework (core)
+MqCSFramework.Consumer ──► MqCSFramework (core)
+```
+
+```
+src/MqCSFramework/                        ← Core shared package (referenced by all)
+  IMessageProcessor.cs                    ← Non-generic + generic processor interfaces
+  IRpcProcessor.cs
+  MessageContext.cs                       ← Message metadata record
+  MqHeaders.cs                           ← Header constants
+  LoggingExtensions.cs                   ← CorrelationScope helper
+  Configuration/
     RabbitMqConnectionOptions.cs
-    StandardSenderOptions.cs
-    RpcSenderOptions.cs
-    ConsumerOptions.cs
-    SendOptions.cs
-    RpcOptions.cs
-  Exceptions/                 ← Custom exception types
+  Exceptions/
     RpcTimeoutException.cs
     RpcRemoteException.cs
     MessageSerializationException.cs
-  Internal/                   ← Internal implementations (not public API)
-    RabbitMqConnection.cs
+  Internal/
+    RabbitMqConnection.cs                ← Shared connection management
+
+src/MqCSFramework.Sender/                ← Sender package
+  IStandardSender.cs
+  IRpcSender.cs
+  ServiceCollectionExtensions.cs         ← AddSender, AddRpcSender, BindConfiguration (sender side)
+  Configuration/
+    StandardSenderOptions.cs
+    RpcSenderOptions.cs
+    SendOptions.cs
+    RpcOptions.cs
+  Internal/
     RabbitMqStandardSender.cs
     RabbitMqRpcSender.cs
     RpcRequestResponseHandler.cs
+    RpcResponseEnvelope.cs
+
+src/MqCSFramework.Consumer/              ← Consumer package
+  StandardProcessor.cs                   ← Abstract base classes
+  RpcProcessor.cs
+  ServiceCollectionExtensions.cs         ← AddConsumer, BindConfiguration (consumer side)
+  Configuration/
+    ConsumerOptions.cs
+  Internal/
     MqConsumer.cs
     ConsumerHostedService.cs
-    RpcResponseEnvelope.cs
-  IMessageProcessor.cs        ← Processor interfaces (non-generic + generic)
-  IRpcProcessor.cs
-  IStandardSender.cs          ← Sender interfaces
-  IRpcSender.cs
-  StandardProcessor.cs        ← Abstract base classes
-  RpcProcessor.cs
-  MessageContext.cs            ← Message metadata record
-  MqHeaders.cs                ← Header constants
-  MqBuilder.cs                ← Fluent DI builder
-  ServiceCollectionExtensions.cs
+    LogMaskingHelper.cs
+    MessageHelpers.cs                ← Static helper: header parsing, retry count, context building
 ```
 
 ### Test Project Structure

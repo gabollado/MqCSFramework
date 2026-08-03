@@ -121,8 +121,8 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 
 1. All log messages use `ILogger` via Serilog
 2. Sample projects configure Serilog with file sink writing to `C:\Logging\` directory
-3. Correlation IDs are logged throughout the pipeline
-4. Option to suppress message body logging
+3. The consumer wraps each message's processing in a logging scope with `CorrelationId` — every log entry during that message's processing automatically includes the correlation ID (via `ILogger.BeginScope`)
+4. Message body logging is controlled via Serilog log level configuration (Debug level) — use per-namespace overrides to enable/disable
 5. Sensitive field masking (configurable list of field names replaced with `***MASKED***`)
 6. Configuration (connection details, queue names, etc.) is read from `appsettings.json` — not hardcoded
 
@@ -152,4 +152,4 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 | 2 | Processors registered as standard DI singletons |
 | 3 | Sender always specifies processor contract interface (no fallback routing) |
 | 4 | Each sender/consumer has its own independent connection |
-| 5 | Single NuGet package: `MqCSFramework` (not split into multiple packages) |
+| 5 | Three packages: `MqCSFramework` (core/shared), `MqCSFramework.Sender`, `MqCSFramework.Consumer` |

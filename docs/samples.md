@@ -32,6 +32,7 @@ samples/
   - Configures Serilog from `appsettings.json`
   - Calls `AddMqCSFramework(builder.Configuration)` to bind all senders from config
   - Resolves `IStandardSender` and `IRpcSender` via keyed DI (`GetRequiredKeyedService`)
+  - Each request creates its own `CancellationTokenSource` with a 10-second timeout
   - Sends a standard `OrderMessage` and an RPC `StockRequest`, logging all values and the response
 
 ### Configuration

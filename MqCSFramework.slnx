@@ -5,6 +5,8 @@
     <Project Path="samples/MqCSFramework.Samples.Sender/MqCSFramework.Samples.Sender.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/MqCSFramework.Consumer/MqCSFramework.Consumer.csproj" />
+    <Project Path="src/MqCSFramework.Sender/MqCSFramework.Sender.csproj" />
     <Project Path="src/MqCSFramework/MqCSFramework.csproj" />
   </Folder>
   <Folder Name="/tests/">

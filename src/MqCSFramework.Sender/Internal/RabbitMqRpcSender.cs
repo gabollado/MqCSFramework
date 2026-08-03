@@ -1,8 +1,9 @@
+using MqCSFramework.Internal;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 
-namespace MqCSFramework.Internal;
+namespace MqCSFramework.Sender.Internal;
 
 /// <summary>
 /// RPC (request-reply) sender implementation.
@@ -28,14 +29,14 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
 
     public async Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(
         TRequest request,
+        string correlationId,
         RpcOptions? options = null,
         CancellationToken ct = default)
         where TProcessor : IRpcProcessor<TRequest, TResponse>
         where TRequest : class
         where TResponse : class
     {
-        var messageId = Guid.NewGuid().ToString();
-        var correlationId = options?.CorrelationId ?? messageId;
+        var messageId = Guid.NewGuid().ToString("N");
         var routingKey = options?.RoutingKey ?? _options.RoutingKey;
         var timeout = options?.Timeout ?? _options.Timeout;
 
@@ -60,7 +61,8 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
             Headers = new Dictionary<string, object?>
             {
                 [MqHeaders.ProcessorType] = typeof(TProcessor).AssemblyQualifiedName,
-                [MqHeaders.Pattern] = MqHeaders.PatternRpc
+                [MqHeaders.Pattern] = MqHeaders.PatternRpc,
+                [MqHeaders.CancellationDeadline] = (DateTimeOffset.UtcNow + timeout).Ticks.ToString()
             }
         };
 
@@ -106,3 +108,4 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
         await _connection.DisposeAsync();
     }
 }
+

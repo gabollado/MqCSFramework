@@ -1,8 +1,9 @@
+using MqCSFramework.Internal;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 
-namespace MqCSFramework.Internal;
+namespace MqCSFramework.Sender.Internal;
 
 /// <summary>
 /// Standard (fire-and-forget) sender implementation using RabbitMQ.
@@ -23,13 +24,13 @@ internal sealed class RabbitMqStandardSender : IStandardSender
 
     public async Task<string> SendAsync<TProcessor, TMessage>(
         TMessage message,
+        string correlationId,
         SendOptions? options = null,
         CancellationToken ct = default)
         where TProcessor : IMessageProcessor<TMessage>
         where TMessage : class
     {
-        var messageId = Guid.NewGuid().ToString();
-        var correlationId = options?.CorrelationId ?? Guid.NewGuid().ToString();
+        var messageId = Guid.NewGuid().ToString("N");
         var routingKey = options?.RoutingKey ?? _options.RoutingKey;
 
         byte[] body;
@@ -83,3 +84,4 @@ internal sealed class RabbitMqStandardSender : IStandardSender
         return messageId;
     }
 }
+

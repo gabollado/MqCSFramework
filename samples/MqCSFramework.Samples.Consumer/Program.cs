@@ -2,6 +2,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using MqCSFramework;
+using MqCSFramework.Consumer;
 using MqCSFramework.Samples.Consumer;
 using MqCSFramework.Samples.Contracts;
 using Serilog;
@@ -18,8 +19,8 @@ builder.Services.AddSerilog(config => config.ReadFrom.Configuration(builder.Conf
 builder.Services.AddSingleton<IOrderProcessor, OrderProcessor>();
 builder.Services.AddSingleton<IStockProcessor, StockProcessor>();
 
-// Configure MqCSFramework — one line, reads everything from "MqCSFramework" section
-builder.Services.AddMqCSFramework(builder.Configuration);
+// Configure MqCSFramework consumers from appsettings.json
+builder.Services.AddMqConsumersFromConfiguration(builder.Configuration);
 
 Console.WriteLine("[Consumer] Starting...");
 await builder.Build().RunAsync();
