@@ -1,51 +1,59 @@
 # Contributing to MqCSFramework
 
-Thanks for your interest in contributing! Here's how to get started.
+## How This Project Works
 
-## Getting Started
+MqCSFramework is a **documentation-driven project**. The code is generated from specification documents — not the other way around.
 
-1. Fork the repository
-2. Clone your fork: `git clone https://github.com/YOUR-USERNAME/MqCSFramework.git`
-3. Create a feature branch: `git checkout -b feature/my-feature`
-4. Make your changes
-5. Ensure the solution builds: `dotnet build MqCSFramework.slnx`
-6. Commit with a clear message
-7. Push and open a Pull Request
+The spec documents in `specs/` are the single source of truth:
+- `requirements.md` — what the framework does
+- `design.md` — how it's built (architecture, interfaces, implementation details)
+- `tasks.md` — step-by-step implementation plan
 
-## Development Setup
+The entire codebase can be regenerated from these documents by an AI agent (Kiro or any other). The code is a **product** of the documentation, not independent of it.
 
-- .NET 10 SDK
-- A RabbitMQ instance for integration testing (local Docker or CloudAMQP free tier)
-- Copy `appsettings.local.json` in the sample projects with your connection credentials (git-ignored)
+## Contributing Changes
+
+### If you want to change behavior or add a feature:
+1. Update the spec documents first (`requirements.md`, `design.md`)
+2. The code should then be regenerated or updated to match
+
+### If you want to fix a bug:
+1. Identify which spec document describes the incorrect behavior
+2. Fix the spec, then fix the code
+
+### If you want to improve documentation:
+1. Edit the relevant file in `specs/` (for spec/design) or `docs/` (for user-facing docs)
+2. Ensure the spec documents remain regeneration-complete — someone (human or AI) should be able to rebuild the entire project from them alone
+
+## Key Principle
+
+> Every change to code MUST be reflected in the spec documents. If it's not in the docs, it doesn't exist.
+
+The workflow is: **documents → code**, never code → documents.
 
 ## Coding Standards
 
-- C# 14, nullable reference types enabled
+- .NET 10, C# 14, nullable reference types enabled
 - Prefer early returns over if/else chains
-- Async/await consistently — no sync-over-async
-- Use `ILogger` structured logging (not string interpolation in log calls)
-- All public types need XML documentation comments
-- Use meaningful names that reveal intent
-- Keep methods under ~30 lines where practical
-- GUIDs use format "N" (no dashes): `Guid.NewGuid().ToString("N")`
-
-## Pull Request Guidelines
-
-- One logical change per PR
-- Include a clear description of what changed and why
-- Ensure the solution builds with zero errors and warnings
-- Update documentation (spec docs or user docs) if behavior changes
-- Don't include credentials or environment-specific config
+- Async/await consistently
+- `ILogger` structured logging
+- GUIDs use format "N" (no dashes)
+- No credentials in committed files
 
 ## Project Structure
 
 ```
-src/MqCSFramework/           ← Core shared package (interfaces, models, exceptions)
-src/MqCSFramework.Sender/   ← Sender implementations + DI registration
-src/MqCSFramework.Consumer/ ← Consumer implementations + DI registration
-tests/MqCSFramework.Tests/  ← Unit and integration tests
-samples/                     ← Working example projects
-docs/                        ← User documentation
+specs/                             ← Source of truth (regeneration spec)
+  requirements.md                  ← What the framework does
+  design.md                        ← How it's built
+  tasks.md                         ← Step-by-step implementation plan
+  steering/                        ← AI agent rules and project conventions
+docs/                              ← User-facing documentation
+src/MqCSFramework/                 ← Core shared package
+src/MqCSFramework.Sender/         ← Sender package
+src/MqCSFramework.Consumer/       ← Consumer package
+samples/                           ← Working examples
+tests/                             ← Tests
 ```
 
 ## License
