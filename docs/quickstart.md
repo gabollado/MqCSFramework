@@ -217,8 +217,16 @@ The sender will print:
 
 ## Setting Up RabbitMQ
 
-<!-- TODO: This section will be filled in later with instructions for:
-     - Local Docker setup
-     - CloudAMQP free tier
-     - Exchange/queue/binding configuration for the examples
--->
+### Docker (local)
+
+```bash
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
+```
+
+Management UI: http://localhost:15672 (guest/guest). The default `appsettings.json` in the samples already points to localhost.
+
+### CloudAMQP (cloud, no Docker)
+
+1. Create a free account at https://www.cloudamqp.com/
+2. Create an instance, copy connection details
+3. Put them in `appsettings.local.json` (git-ignored) with `"UseSsl": true` and `"Port": 5671`

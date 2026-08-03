@@ -112,9 +112,23 @@ In the sender, resolve `IStandardSender` or `IRpcSender` via keyed DI and call `
 
 ## Setting Up RabbitMQ
 
-<!-- TODO: This section will be completed later with:
-     - Running RabbitMQ locally with Docker
-     - Setting up a free CloudAMQP instance
-     - Creating queues, exchanges, and bindings for the examples
-     - Management UI walkthrough
--->
+### Option 1: Docker (local development)
+
+```bash
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
+```
+
+Management UI: http://localhost:15672 (guest/guest)
+
+### Option 2: CloudAMQP (free tier, no Docker needed)
+
+1. Go to https://www.cloudamqp.com/ and create a free account
+2. Create a new instance (free "Little Lemur" plan)
+3. Copy the connection details (host, user, password, vhost) into your `appsettings.local.json`
+4. Use port 5671 with `UseSsl: true` for cloud instances
+
+### Queue Configuration
+
+The framework declares queues automatically on consumer startup (durable, non-exclusive, non-auto-delete). No manual queue creation is needed for basic usage.
+
+For RPC, the sender creates an exclusive auto-delete reply queue automatically.

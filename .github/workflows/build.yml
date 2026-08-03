@@ -1,0 +1,28 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore MqCSFramework.slnx
+
+      - name: Build
+        run: dotnet build MqCSFramework.slnx --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test MqCSFramework.slnx --no-build --configuration Release --verbosity normal
