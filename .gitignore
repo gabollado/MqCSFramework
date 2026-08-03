@@ -45,3 +45,6 @@ bld/
 ## OS generated
 .DS_Store
 Thumbs.db
+
+## Local config (credentials)
+appsettings.local.json

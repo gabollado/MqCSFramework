@@ -11,6 +11,49 @@ samples/
 └── MqCSFramework.Samples.Consumer/    ← Processes messages from queues
 ```
 
+### Project Structure
+
+- **Contracts** — A class library containing the message records (`OrderMessage`, `StockRequest`, `StockResponse`) and processor contract interfaces (`IOrderProcessor`, `IStockProcessor`). Referenced by both sender and consumer. Only references `MqCSFramework`.
+
+  Key types:
+  - `public record OrderMessage(Guid OrderId, string CustomerName, decimal Amount, DateTimeOffset CreatedAt)`
+  - `public record StockRequest(string Sku, int Quantity)`
+  - `public record StockResponse(bool Available, int RemainingStock, decimal UnitPrice)`
+  - `public interface IOrderProcessor : IMessageProcessor<OrderMessage>`
+  - `public interface IStockProcessor : IRpcProcessor<StockRequest, StockResponse>`
+
+- **Consumer** — A Generic Host console app that:
+  - Configures Serilog from `appsettings.json`
+  - Registers processor implementations as DI singletons (`AddSingleton<IOrderProcessor, OrderProcessor>()`)
+  - Calls `AddMqCSFramework(builder.Configuration)` to bind all consumers from config
+  - Processor implementations inherit from `StandardProcessor<T>` or `RpcProcessor<TReq, TRes>`, implement the contract interface, inject `ILogger<T>` via primary constructor, and log all received context values and message properties
+
+- **Sender** — A console app that:
+  - Configures Serilog from `appsettings.json`
+  - Calls `AddMqCSFramework(builder.Configuration)` to bind all senders from config
+  - Resolves `IStandardSender` and `IRpcSender` via keyed DI (`GetRequiredKeyedService`)
+  - Sends a standard `OrderMessage` and an RPC `StockRequest`, logging all values and the response
+
+### Configuration
+
+Both sender and consumer read connection details from `appsettings.json` (format documented in [Configuration Reference](configuration.md)). The key specifics for the samples:
+
+- **Consumer queues:** `orders-queue` (standard, prefetch 20, max retries 3) and `stock-queue` (RPC, prefetch 10)
+- **Sender routing keys:** `orders-queue` (standard) and `stock-queue` (RPC, timeout 10s)
+- **Serilog:** Console + File sink to `C:\Logging\`
+- **Connection credentials:** Stored in `appsettings.local.json` (git-ignored) — copy `appsettings.json` and fill in your connection details
+
+### Package References (samples)
+
+Both sender and consumer reference:
+- `MqCSFramework` (the framework itself)
+- `MqCSFramework.Samples.Contracts` (shared messages + interfaces)
+- `Microsoft.Extensions.Hosting`
+- `Serilog.Extensions.Hosting`
+- `Serilog.Sinks.Console`
+- `Serilog.Sinks.File`
+- `Serilog.Settings.Configuration`
+
 ### Running the Samples
 
 **1. Start the consumer:**
@@ -20,14 +63,7 @@ cd samples/MqCSFramework.Samples.Consumer
 dotnet run
 ```
 
-Expected output:
-```
-[Consumer] Starting...
-[INF] Starting 2 consumer(s)
-[INF] Consumer started on queue 'orders-queue' with prefetch 20
-[INF] Consumer started on queue 'stock-queue' with prefetch 10
-[INF] All consumers started
-```
+The consumer will connect to RabbitMQ, declare the queues, and start listening.
 
 **2. In another terminal, run the sender:**
 
@@ -36,200 +72,40 @@ cd samples/MqCSFramework.Samples.Sender
 dotnet run
 ```
 
-Expected output:
-```
-[INF] Published standard message <id> for processor IOrderProcessor to /orders-queue
-[Sender] Order sent: <id>
-[INF] Published RPC request <id> for processor IStockProcessor to /stock-queue
-[Sender] Stock check: Available=True, Remaining=42
-```
-
-**3. Back in the consumer terminal, you'll see:**
-
-```
-[Consumer] Processing order <id> for Alice - Amount: 99,99 €
-[INF] Message <id> processed successfully by IOrderProcessor. ACK.
-[Consumer] Checking stock for SKU SKU-12345, quantity 2
-```
-
-### Sample Structure
-
-#### Contracts (shared between sender and consumer)
-
-```csharp
-// Messages
-public record OrderMessage(Guid OrderId, string CustomerName, decimal Amount, DateTimeOffset CreatedAt);
-public record StockRequest(string Sku, int Quantity);
-public record StockResponse(bool Available, int RemainingStock, decimal UnitPrice);
-
-// Processor interfaces
-public interface IOrderProcessor : IMessageProcessor<OrderMessage>;
-public interface IStockProcessor : IRpcProcessor<StockRequest, StockResponse>;
-```
-
-#### Consumer processors
-
-```csharp
-public class OrderProcessor : StandardProcessor<OrderMessage>, IOrderProcessor
-{
-    public override Task ProcessAsync(OrderMessage message, MessageContext context, CancellationToken ct = default)
-    {
-        Console.WriteLine($"Processing order {message.OrderId} for {message.CustomerName}");
-        return Task.CompletedTask;
-    }
-}
-
-public class StockProcessor : RpcProcessor<StockRequest, StockResponse>, IStockProcessor
-{
-    public override Task<StockResponse> ProcessAsync(StockRequest request, MessageContext context, CancellationToken ct = default)
-    {
-        return Task.FromResult(new StockResponse(Available: true, RemainingStock: 42, UnitPrice: 19.99m));
-    }
-}
-```
-
-#### Consumer Program.cs
-
-```csharp
-var builder = Host.CreateApplicationBuilder(args);
-
-builder.Services.AddSerilog(config => config.ReadFrom.Configuration(builder.Configuration));
-builder.Services.AddSingleton<IOrderProcessor, OrderProcessor>();
-builder.Services.AddSingleton<IStockProcessor, StockProcessor>();
-builder.Services.AddMqCSFramework(builder.Configuration);
-
-await builder.Build().RunAsync();
-```
-
-#### Sender Program.cs
-
-```csharp
-var builder = Host.CreateApplicationBuilder(args);
-
-builder.Services.AddSerilog(config => config.ReadFrom.Configuration(builder.Configuration));
-builder.Services.AddMqCSFramework(builder.Configuration);
-
-var app = builder.Build();
-
-var sender = app.Services.GetRequiredKeyedService<IStandardSender>("orders");
-await sender.SendAsync<IOrderProcessor, OrderMessage>(new OrderMessage(...));
-
-var rpcSender = app.Services.GetRequiredKeyedService<IRpcSender>("stock");
-var response = await rpcSender.SendAsync<IStockProcessor, StockResponse, StockRequest>(new StockRequest(...));
-```
+The sender will publish a standard order message and an RPC stock request. You'll see the full round-trip in both terminals with message IDs, correlation IDs, timestamps, and all message property values.
 
 ---
 
 ## Creating Your Own Example
 
-### Step 1: Create the solution
+### 1. Create the solution structure
 
-```bash
-mkdir MyMessagingApp && cd MyMessagingApp
-dotnet new sln
-dotnet new classlib -n MyApp.Contracts
-dotnet new console -n MyApp.Sender
-dotnet new console -n MyApp.Consumer
-dotnet sln add MyApp.Contracts MyApp.Sender MyApp.Consumer
-```
+Three projects: a shared contracts library, a sender console app, and a consumer console app. Both sender and consumer reference the contracts project and the MqCSFramework package.
 
-### Step 2: Add references
+### 2. Define contracts
 
-```bash
-# Both sender and consumer reference contracts
-dotnet add MyApp.Sender reference MyApp.Contracts
-dotnet add MyApp.Consumer reference MyApp.Contracts
+In the contracts project, define:
+- Message records (the data you're sending)
+- Processor contract interfaces inheriting from `IMessageProcessor<TMessage>` or `IRpcProcessor<TRequest, TResponse>`
 
-# Both reference MqCSFramework
-dotnet add MyApp.Sender reference path/to/MqCSFramework.csproj
-dotnet add MyApp.Consumer reference path/to/MqCSFramework.csproj
+### 3. Implement processors
 
-# Add Serilog to both
-dotnet add MyApp.Sender package Serilog.Extensions.Hosting
-dotnet add MyApp.Sender package Serilog.Sinks.Console
-dotnet add MyApp.Sender package Serilog.Sinks.File
-dotnet add MyApp.Sender package Serilog.Settings.Configuration
-dotnet add MyApp.Consumer package Serilog.Extensions.Hosting
-dotnet add MyApp.Consumer package Serilog.Sinks.Console
-dotnet add MyApp.Consumer package Serilog.Sinks.File
-dotnet add MyApp.Consumer package Serilog.Settings.Configuration
-```
+In the consumer project, create classes that:
+- Inherit from `StandardProcessor<TMessage>` (for fire-and-forget) or `RpcProcessor<TRequest, TResponse>` (for RPC)
+- Implement the processor contract interface
+- Accept `ILogger<T>` via primary constructor for structured logging
+- Override `ProcessAsync` with your business logic
 
-### Step 3: Define your messages and processor interface
+### 4. Register and configure
 
-In `MyApp.Contracts`:
+- Register processors as DI singletons: `services.AddSingleton<IMyProcessor, MyProcessorImpl>()`
+- Add framework: `services.AddMqCSFramework(configuration)`
+- Add Serilog: `services.AddSerilog(config => config.ReadFrom.Configuration(configuration))`
+- Provide `appsettings.json` with Serilog and MqCSFramework sections
 
-```csharp
-public record EmailRequest(string To, string Subject, string Body);
+### 5. Send messages
 
-public interface IEmailProcessor : IMessageProcessor<EmailRequest>;
-```
-
-### Step 4: Implement the processor
-
-In `MyApp.Consumer`:
-
-```csharp
-public class EmailProcessor : StandardProcessor<EmailRequest>, IEmailProcessor
-{
-    public override Task ProcessAsync(EmailRequest message, MessageContext context, CancellationToken ct = default)
-    {
-        Console.WriteLine($"Sending email to {message.To}: {message.Subject}");
-        // Your email sending logic here
-        return Task.CompletedTask;
-    }
-}
-```
-
-### Step 5: Wire up
-
-Consumer `Program.cs`:
-```csharp
-var builder = Host.CreateApplicationBuilder(args);
-builder.Services.AddSerilog(config => config.ReadFrom.Configuration(builder.Configuration));
-builder.Services.AddSingleton<IEmailProcessor, EmailProcessor>();
-builder.Services.AddMqCSFramework(builder.Configuration);
-await builder.Build().RunAsync();
-```
-
-Sender `Program.cs`:
-```csharp
-var builder = Host.CreateApplicationBuilder(args);
-builder.Services.AddSerilog(config => config.ReadFrom.Configuration(builder.Configuration));
-builder.Services.AddMqCSFramework(builder.Configuration);
-var app = builder.Build();
-
-var sender = app.Services.GetRequiredKeyedService<IStandardSender>("email");
-await sender.SendAsync<IEmailProcessor, EmailRequest>(
-    new EmailRequest("user@example.com", "Welcome!", "Hello from MqCSFramework"));
-```
-
-### Step 6: Add appsettings.json to both projects
-
-```json
-{
-  "Serilog": {
-    "Using": ["Serilog.Sinks.Console"],
-    "MinimumLevel": "Information",
-    "WriteTo": [{ "Name": "Console" }]
-  },
-  "MqCSFramework": {
-    "Senders": {
-      "email": {
-        "Connection": { "HostName": "localhost" },
-        "Exchange": "",
-        "RoutingKey": "email-queue"
-      }
-    },
-    "Consumers": {
-      "email": {
-        "Connection": { "HostName": "localhost" },
-        "QueueName": "email-queue"
-      }
-    }
-  }
-}
-```
+In the sender, resolve `IStandardSender` or `IRpcSender` via keyed DI and call `SendAsync` with the processor interface as the generic parameter.
 
 ---
 

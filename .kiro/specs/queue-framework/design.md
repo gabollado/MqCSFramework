@@ -263,7 +263,7 @@ namespace MqCSFramework;
 /// </summary>
 public sealed class RabbitMqConnectionOptions
 {
-    public required string HostName { get; set; }
+    public string HostName { get; set; } = "localhost";
     public int Port { get; set; } = 5672;
     public string UserName { get; set; } = "guest";
     public string Password { get; set; } = "guest";
@@ -277,8 +277,8 @@ public sealed class RabbitMqConnectionOptions
 /// </summary>
 public sealed class StandardSenderOptions
 {
-    public required RabbitMqConnectionOptions Connection { get; set; }
-    public required string Exchange { get; set; }
+    public RabbitMqConnectionOptions Connection { get; set; } = new();
+    public string Exchange { get; set; } = "";
     public string RoutingKey { get; set; } = "";
 }
 
@@ -287,8 +287,8 @@ public sealed class StandardSenderOptions
 /// </summary>
 public sealed class RpcSenderOptions
 {
-    public required RabbitMqConnectionOptions Connection { get; set; }
-    public required string Exchange { get; set; }
+    public RabbitMqConnectionOptions Connection { get; set; } = new();
+    public string Exchange { get; set; } = "";
     public string RoutingKey { get; set; } = "";
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
 }
@@ -298,8 +298,8 @@ public sealed class RpcSenderOptions
 /// </summary>
 public sealed class ConsumerOptions
 {
-    public required RabbitMqConnectionOptions Connection { get; set; }
-    public required string QueueName { get; set; }
+    public RabbitMqConnectionOptions Connection { get; set; } = new();
+    public string QueueName { get; set; } = "";
     public ushort PrefetchCount { get; set; } = 10;
     public int MaxRetries { get; set; } = 3;
     public string? DeadLetterExchange { get; set; }
@@ -461,9 +461,9 @@ internal sealed class MqConsumer : IAsyncDisposable
         // 1. Read mq-processor-type header → Type.GetType(value)
         // 2. Read mq-pattern header ("standard" or "rpc")
         // 3. Resolve processor from DI: _serviceProvider.GetService(processorType)
-        // 4. If standard: cast to IProcessorDispatch → call DispatchAsync(body, context, ct)
+        // 4. If standard: cast to IMessageProcessor (non-generic) → call ProcessRawAsync(body, context, ct)
         //    The base class (StandardProcessor<T>) deserializes and calls typed ProcessAsync
-        // 5. If RPC: cast to IRpcProcessorDispatch → call DispatchRpcAsync(body, context, ct)
+        // 5. If RPC: cast to IRpcProcessor (non-generic) → call ProcessRawRpcAsync(body, context, ct)
         //    The base class (RpcProcessor<TReq, TRes>) deserializes, calls ProcessAsync, serializes response
         // 6. On success: ACK. On failure: retry logic (increment mq-retry-count, dead-letter if exceeded)
         // NO REFLECTION — dispatch is a simple interface cast + method call
@@ -494,6 +494,40 @@ internal sealed class ConsumerHostedService : BackgroundService
         // Await stoppingToken cancellation
         // On shutdown: dispose all consumers (triggers graceful close)
     }
+}
+```
+
+### Header Constants
+
+```csharp
+namespace MqCSFramework;
+
+public static class MqHeaders
+{
+    public const string ProcessorType = "mq-processor-type";
+    public const string Pattern = "mq-pattern";
+    public const string RetryCount = "mq-retry-count";
+
+    public const string PatternStandard = "standard";
+    public const string PatternRpc = "rpc";
+}
+```
+
+### Log Masking Helper
+
+```csharp
+namespace MqCSFramework.Internal;
+
+/// <summary>
+/// Masks sensitive field values in JSON strings for logging.
+/// Uses System.Text.Json.Nodes to parse, replace matching field values with "***MASKED***",
+/// and return the masked string. Case-insensitive field name matching.
+/// Returns original string unchanged if maskedFields is null/empty or json is invalid.
+/// </summary>
+internal static class LogMaskingHelper
+{
+    public static string Mask(string? json, HashSet<string>? maskedFields);
+    public static HashSet<string>? BuildFieldSet(IReadOnlyList<string>? fieldNames);
 }
 ```
 
@@ -581,85 +615,56 @@ internal sealed class RabbitMqStandardSender : IStandardSender
 ```csharp
 namespace MqCSFramework.Internal;
 
-internal sealed class RabbitMqRpcSender : IRpcSender
+/// <summary>
+/// Manages the reply queue consumer for RPC responses.
+/// Owns the pending request dictionary and handles correlation lifecycle:
+/// register, match, timeout, cleanup.
+/// </summary>
+internal sealed class RpcRequestResponseHandler
+{
+    private readonly RabbitMqConnection _connection;
+    private readonly string _replyQueueName;
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<byte[]>> _pending = new();
+
+    public string ReplyQueueName => _replyQueueName;
+
+    public async Task EnsureStartedAsync(CancellationToken ct)
+    {
+        // Lazy init: declare exclusive auto-delete reply queue, start consuming
+        // On message received: correlate by CorrelationId → complete the matching TCS
+    }
+
+    /// <summary>
+    /// Registers a pending request, ensures the consumer is started, publishes the message,
+    /// and returns the response bytes. Handles timeout internally.
+    /// </summary>
+    public Task<byte[]> PublishAndAwaitReplyAsync(
+        RabbitMqConnection connection, string exchange, string routingKey,
+        BasicProperties props, byte[] body, string correlationId,
+        TimeSpan timeout, CancellationToken ct);
+
+    /// <summary>
+    /// Removes a pending request (cleanup on error or cancellation).
+    /// </summary>
+    public void RemovePending(string correlationId);
+}
+
+/// <summary>
+/// RPC sender. Delegates reply correlation entirely to RpcRequestResponseHandler.
+/// </summary>
+internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
 {
     private readonly RabbitMqConnection _connection;
     private readonly RpcSenderOptions _options;
     private readonly ILogger<RabbitMqRpcSender> _logger;
+    private readonly RpcRequestResponseHandler _replyConsumer;
 
-    // Pending RPC calls awaiting responses
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<byte[]>> _pending = new();
-
-    public async Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(
-        TRequest request, RpcOptions? options = null, CancellationToken ct = default)
-        where TProcessor : IRpcProcessor<TRequest, TResponse>
-        where TRequest : class
-        where TResponse : class
+    public async Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(...)
     {
-        var messageId = Guid.NewGuid().ToString();
-        var correlationId = options?.CorrelationId ?? messageId;
-        var timeout = options?.Timeout ?? _options.Timeout;
-        var routingKey = options?.RoutingKey ?? _options.RoutingKey;
-
-        var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[correlationId] = tcs;
-
-        try
-        {
-            var body = JsonSerializer.SerializeToUtf8Bytes(request);
-            var channel = await _connection.GetChannelAsync(ct);
-
-            var props = new BasicProperties
-            {
-                MessageId = messageId,
-                CorrelationId = correlationId,
-                ReplyTo = _replyQueueName, // "{routingKey}.reply.{guid}" — unique per sender instance
-                Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
-                ContentType = "application/json",
-                Headers = new Dictionary<string, object?>
-                {
-                    ["mq-processor-type"] = typeof(TProcessor).AssemblyQualifiedName,
-                    ["mq-pattern"] = "rpc"
-                }
-            };
-
-            await channel.BasicPublishAsync(_options.Exchange, routingKey, false, props, body, ct);
-
-            // Await response with timeout
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(timeout);
-
-            var responseBytes = await tcs.Task.WaitAsync(cts.Token);
-
-            // Check for error response
-            // Deserialize and return
-            return JsonSerializer.Deserialize<TResponse>(responseBytes)
-                ?? throw new InvalidOperationException("Failed to deserialize RPC response");
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            throw new RpcTimeoutException(correlationId, timeout);
-        }
-        finally
-        {
-            _pending.TryRemove(correlationId, out _);
-        }
-    }
-
-    // Called by the reply consumer when a response arrives
-    internal void HandleReply(string correlationId, byte[] body, bool isError)
-    {
-        if (!_pending.TryGetValue(correlationId, out var tcs))
-            return;
-
-        if (isError)
-        {
-            var errorMessage = JsonSerializer.Deserialize<string>(body) ?? "Unknown remote error";
-            tcs.SetException(new RpcRemoteException(correlationId, errorMessage));
-            return;
-        }
-
-        tcs.SetResult(body);
+        // 1. Serialize request
+        // 2. Build BasicProperties with headers
+        // 3. var responseTask = await _replyConsumer.PublishAndAwaitReplyAsync(connection, exchange, routingKey, props, body, correlationId, timeout, ct)
+        // 4. Deserialize RpcResponseEnvelope → error or TResponse
     }
 }
 ```
@@ -925,6 +930,7 @@ src/MqCSFramework/
     RabbitMqConnection.cs
     RabbitMqStandardSender.cs
     RabbitMqRpcSender.cs
+    RpcRequestResponseHandler.cs
     MqConsumer.cs
     ConsumerHostedService.cs
     RpcResponseEnvelope.cs

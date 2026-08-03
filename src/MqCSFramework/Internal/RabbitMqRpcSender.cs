@@ -1,14 +1,12 @@
-using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
 
 namespace MqCSFramework.Internal;
 
 /// <summary>
-/// RPC (request-reply) sender implementation using a named exclusive reply queue.
-/// Each instance owns its own connection and manages pending request correlation.
+/// RPC (request-reply) sender implementation.
+/// Delegates reply correlation entirely to RpcRequestResponseHandler.
 /// Reply queue format: {routingKey}.reply.{GUID}
 /// </summary>
 internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
@@ -16,17 +14,16 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
     private readonly RabbitMqConnection _connection;
     private readonly RpcSenderOptions _options;
     private readonly ILogger<RabbitMqRpcSender> _logger;
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<byte[]>> _pending = new();
-    private readonly SemaphoreSlim _initLock = new(1, 1);
-    private readonly string _replyQueueName;
-    private bool _replyConsumerStarted;
+    private readonly RpcRequestResponseHandler _replyConsumer;
 
     public RabbitMqRpcSender(RabbitMqConnection connection, RpcSenderOptions options, ILogger<RabbitMqRpcSender> logger)
     {
         _connection = connection;
         _options = options;
         _logger = logger;
-        _replyQueueName = $"{options.RoutingKey}.reply.{Guid.NewGuid():N}";
+
+        var replyQueueName = $"{options.RoutingKey}.reply.{Guid.NewGuid():N}";
+        _replyConsumer = new RpcRequestResponseHandler(connection, replyQueueName, logger);
     }
 
     public async Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(
@@ -53,152 +50,59 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
                 $"Failed to serialize RPC request of type '{typeof(TRequest).FullName}'.", messageId, ex);
         }
 
-        var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[correlationId] = tcs;
-
-        try
+        var props = new BasicProperties
         {
-            await EnsureReplyConsumerAsync(ct);
-
-            var channel = await _connection.GetChannelAsync(ct);
-
-            var props = new BasicProperties
+            MessageId = messageId,
+            CorrelationId = correlationId,
+            ReplyTo = _replyConsumer.ReplyQueueName,
+            Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+            ContentType = "application/json",
+            Headers = new Dictionary<string, object?>
             {
-                MessageId = messageId,
-                CorrelationId = correlationId,
-                ReplyTo = _replyQueueName,
-                Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
-                ContentType = "application/json",
-                Headers = new Dictionary<string, object?>
-                {
-                    [MqHeaders.ProcessorType] = typeof(TProcessor).AssemblyQualifiedName,
-                    [MqHeaders.Pattern] = MqHeaders.PatternRpc
-                }
-            };
-
-            if (options?.AdditionalHeaders is not null)
-            {
-                foreach (var kvp in options.AdditionalHeaders)
-                {
-                    props.Headers[kvp.Key] = kvp.Value;
-                }
+                [MqHeaders.ProcessorType] = typeof(TProcessor).AssemblyQualifiedName,
+                [MqHeaders.Pattern] = MqHeaders.PatternRpc
             }
+        };
 
-            await channel.BasicPublishAsync(_options.Exchange, routingKey, false, props, body, ct);
-
-            _logger.LogInformation("Published RPC request {MessageId} for processor {Processor} to {Exchange}/{RoutingKey}",
-                messageId, typeof(TProcessor).Name, _options.Exchange, routingKey);
-
-            // Await response with timeout
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(timeout);
-
-            byte[] responseBytes;
-            try
-            {
-                responseBytes = await tcs.Task.WaitAsync(cts.Token);
-            }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                throw new RpcTimeoutException(correlationId, timeout);
-            }
-
-            // Check for error response
-            var envelope = JsonSerializer.Deserialize<RpcResponseEnvelope>(responseBytes);
-            if (envelope is { IsError: true })
-            {
-                throw new RpcRemoteException(correlationId, envelope.ErrorMessage ?? "Unknown error", envelope.ErrorType);
-            }
-
-            // Deserialize actual response from payload
-            if (envelope?.Payload is null)
-            {
-                throw new MessageSerializationException("RPC response payload was null.", messageId);
-            }
-
-            var response = JsonSerializer.Deserialize<TResponse>(envelope.Payload);
-            if (response is null)
-            {
-                throw new MessageSerializationException(
-                    $"Failed to deserialize RPC response to type '{typeof(TResponse).FullName}'.", messageId);
-            }
-
-            return response;
-        }
-        finally
+        if (options?.AdditionalHeaders is not null)
         {
-            _pending.TryRemove(correlationId, out _);
-        }
-    }
-
-    private async Task EnsureReplyConsumerAsync(CancellationToken ct)
-    {
-        if (_replyConsumerStarted)
-        {
-            return;
+            foreach (var kvp in options.AdditionalHeaders)
+            {
+                props.Headers[kvp.Key] = kvp.Value;
+            }
         }
 
-        await _initLock.WaitAsync(ct);
-        try
+        _logger.LogInformation("Publishing RPC request {MessageId} for processor {Processor} to {Exchange}/{RoutingKey}",
+            messageId, typeof(TProcessor).Name, _options.Exchange, routingKey);
+
+        var responseBytes = await _replyConsumer.PublishAndAwaitReplyAsync(
+            _options.Exchange, routingKey, props, body, correlationId, timeout, ct);
+
+        // Check for error response
+        var envelope = JsonSerializer.Deserialize<RpcResponseEnvelope>(responseBytes);
+        if (envelope is { IsError: true })
         {
-            if (_replyConsumerStarted)
-            {
-                return;
-            }
-
-            var channel = await _connection.GetChannelAsync(ct);
-
-            // Declare exclusive, auto-delete reply queue
-            await channel.QueueDeclareAsync(
-                queue: _replyQueueName,
-                durable: false,
-                exclusive: true,
-                autoDelete: true,
-                arguments: null,
-                cancellationToken: ct);
-
-            var consumer = new AsyncEventingBasicConsumer(channel);
-            consumer.ReceivedAsync += HandleReplyAsync;
-
-            await channel.BasicConsumeAsync(_replyQueueName, autoAck: true, consumer: consumer, cancellationToken: ct);
-            _replyConsumerStarted = true;
-
-            _logger.LogInformation("RPC reply consumer started on queue '{ReplyQueue}'", _replyQueueName);
-        }
-        finally
-        {
-            _initLock.Release();
-        }
-    }
-
-    private Task HandleReplyAsync(object sender, BasicDeliverEventArgs ea)
-    {
-        var correlationId = ea.BasicProperties?.CorrelationId;
-        if (correlationId is null)
-        {
-            return Task.CompletedTask;
+            throw new RpcRemoteException(correlationId, envelope.ErrorMessage ?? "Unknown error", envelope.ErrorType);
         }
 
-        if (_pending.TryRemove(correlationId, out var tcs))
+        if (envelope?.Payload is null)
         {
-            tcs.TrySetResult(ea.Body.ToArray());
+            throw new MessageSerializationException("RPC response payload was null.", messageId);
         }
 
-        return Task.CompletedTask;
+        var response = JsonSerializer.Deserialize<TResponse>(envelope.Payload);
+        if (response is null)
+        {
+            throw new MessageSerializationException(
+                $"Failed to deserialize RPC response to type '{typeof(TResponse).FullName}'.", messageId);
+        }
+
+        return response;
     }
 
     public async ValueTask DisposeAsync()
     {
-        // Cancel all pending requests
-        foreach (var kvp in _pending)
-        {
-            if (_pending.TryRemove(kvp.Key, out var tcs))
-            {
-                tcs.TrySetCanceled();
-            }
-        }
-
+        _replyConsumer.Dispose();
         await _connection.DisposeAsync();
-        _initLock.Dispose();
     }
 }

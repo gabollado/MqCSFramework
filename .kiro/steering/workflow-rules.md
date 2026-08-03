@@ -2,26 +2,18 @@
 
 ## Critical Rule: Documentation-First Development
 
-**Every change to the code MUST be reflected in the spec documents (requirements.md, design.md, tasks.md) BEFORE or IMMEDIATELY AFTER implementation.**
+**Every change to the code MUST be reflected in the spec documents (requirements.md, design.md, tasks.md) BEFORE implementation. Update docs FIRST, then code.**
 
 The objective is that the full project can be regenerated from scratch using only the spec documents. The documents are the single source of truth. If the documents don't describe something, it doesn't exist.
 
-### What this means in practice:
+### Enforcement:
 
-1. **When making a design change** (e.g., simplifying a dispatch pattern, changing an interface, removing a class):
-   - Update requirements.md if acceptance criteria changed
-   - Update design.md with the new approach, code samples, and architecture
-   - Update tasks.md if the implementation steps changed
+1. **BEFORE making any code change** — update the relevant spec document first (design.md for structural changes, requirements.md for behavior changes)
+2. **Never write code without updating docs in the same action**
+3. **If you forget — stop, update docs immediately before continuing**
+4. **No commits should ever contain code changes without corresponding doc changes**
 
-2. **When adding new functionality:**
-   - Add it to requirements first
-   - Then design
-   - Then tasks
-
-3. **When removing functionality:**
-   - Remove from all three documents
-
-4. **Never leave the documents stale.** After every significant code change, check: "Could someone regenerate this from the docs alone?" If not, update them.
+This rule exists because the developer WILL delete all code and regenerate from docs alone. If a change isn't in the docs, it will be lost.
 
 ## Project-Specific Rules
 
