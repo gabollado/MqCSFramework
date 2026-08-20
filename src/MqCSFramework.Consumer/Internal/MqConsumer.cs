@@ -1,6 +1,7 @@
 using MqCSFramework.Internal;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
@@ -14,17 +15,17 @@ namespace MqCSFramework.Consumer.Internal;
 internal sealed class MqConsumer : IAsyncDisposable
 {
     private readonly ConsumerOptions _options;
-    private readonly IServiceProvider _serviceProvider;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MqConsumer> _logger;
     private readonly HashSet<string>? _maskedFields;
 
     private RabbitMqConnection? _connection;
     private IChannel? _channel;
 
-    public MqConsumer(ConsumerOptions options, IServiceProvider serviceProvider, ILogger<MqConsumer> logger)
+    public MqConsumer(ConsumerOptions options, IServiceScopeFactory scopeFactory, ILogger<MqConsumer> logger)
     {
         _options = options;
-        _serviceProvider = serviceProvider;
+        _scopeFactory = scopeFactory;
         _logger = logger;
         _maskedFields = options.MaskedFields.Count > 0
             ? new HashSet<string>(options.MaskedFields, StringComparer.OrdinalIgnoreCase)
@@ -96,8 +97,11 @@ internal sealed class MqConsumer : IAsyncDisposable
                 return;
             }
 
-            // 3. Resolve processor from DI
-            var processor = _serviceProvider.GetService(processorType);
+            // 3. Resolve processor from its own DI scope so scoped dependencies
+            // (e.g. DbContext) are not shared across messages. The scope is disposed
+            // when message processing finishes.
+            using var scope = _scopeFactory.CreateScope();
+            var processor = scope.ServiceProvider.GetService(processorType);
             if (processor is null)
             {
                 _logger.LogError("Processor '{ProcessorType}' not registered in DI for message {MessageId}. NACK without requeue.",

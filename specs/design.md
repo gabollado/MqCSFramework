@@ -785,13 +785,13 @@ Class: ConsumerHostedService
 Extends: background/hosted service base class
 Fields:
   - registrations: read-only list of ConsumerRegistration
-  - serviceProvider: DI service provider
+  - scopeFactory: IServiceScopeFactory
   - loggerFactory: logger factory
   - logger: logger instance
   - consumers: mutable list of MqConsumer
 Constructor parameters:
   - registrations: collection of ConsumerRegistration (injected from DI)
-  - serviceProvider: DI service provider
+  - scopeFactory: IServiceScopeFactory
   - loggerFactory: logger factory
   - logger: logger instance
 
@@ -799,7 +799,7 @@ Execute behavior (runs on background thread):
   1. If no registrations: log warning "No consumers registered", idle indefinitely until cancellation, return
   2. Log info "Starting {Count} consumer(s)"
   3. For each registration:
-     - Create a new MqConsumer with registration.Options, serviceProvider, and a new logger
+     - Create a new MqConsumer with registration.Options, scopeFactory, and a new logger
      - Add to consumers list
      - Call consumer.StartAsync(cancellationToken)
   4. Log info "All consumers started"
@@ -810,14 +810,14 @@ Execute behavior (runs on background thread):
 
 #### MqConsumer (Internal)
 
-Manages a single consumer — owns its connection, channel, and message dispatch loop. Resolves processors directly from DI using the `mq-processor-type` header. Final/non-inheritable, internal. Implements async disposable/cleanup pattern.
+Manages a single consumer — owns its connection, channel, and message dispatch loop. Resolves processors from a per-message DI scope using the `mq-processor-type` header, ensuring scoped dependencies (e.g. DbContext) are not shared across messages. Final/non-inheritable, internal. Implements async disposable/cleanup pattern.
 
 ```
 Class: MqConsumer
 Implements: async disposable/cleanup pattern
 Fields:
   - options: ConsumerOptions
-  - serviceProvider: DI service provider
+  - scopeFactory: IServiceScopeFactory
   - logger: logger instance
   - maskedFields: set of strings (case-insensitive) or null
     Built from options.MaskedFields if non-empty, null otherwise.
@@ -825,7 +825,7 @@ Fields:
   - channel: channel object or null
 Constructor parameters:
   - options: ConsumerOptions
-  - serviceProvider: DI service provider
+  - scopeFactory: IServiceScopeFactory
   - logger: logger instance
 
 Method: StartAsync
@@ -856,14 +856,19 @@ Behavior:
 Dispatch logic:
 1. Read `mq-processor-type` header → if missing, log warning + NACK without requeue, return
 2. Resolve type by name from the header value → if null (type not found), log error + NACK without requeue, return
-3. Resolve service from DI using the resolved type → if null (not registered), log error + NACK without requeue, return
-4. Read `mq-pattern` header → if missing, log warning + NACK without requeue, return
-5. Log message body at debug level (masked if `MaskedFields` configured)
-6. Build `MessageContext` via `MessageHelpers.BuildContext(...)`
-7. Dispatch based on pattern value:
+3. Create a new DI scope via `scopeFactory.CreateScope()` (disposed when message processing finishes)
+4. Resolve service from the scoped provider using the resolved type → if null (not registered), log error + NACK without requeue, return
+5. Read `mq-pattern` header → if missing, log warning + NACK without requeue, return
+6. Log message body at debug level (masked if `MaskedFields` configured)
+7. Build `MessageContext` via `MessageHelpers.BuildContext(...)`
+8. Dispatch based on pattern value:
    - `"standard"`: call DispatchStandardAsync
    - `"rpc"`: call DispatchRpcAsync
-8. On unhandled exception during processing: call HandleFailureAsync
+9. On unhandled exception during processing: call HandleFailureAsync
+
+Note: The scope-per-message pattern ensures that scoped dependencies (e.g. DbContext) get a fresh
+instance per message and are deterministically disposed after processing. Singletons are unaffected
+(shared across all scopes). This mirrors what ASP.NET Core does per HTTP request.
 
 **Method: DispatchStandardAsync** (private)
 
