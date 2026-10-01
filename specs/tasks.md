@@ -20,14 +20,20 @@ The implementation language is C# 14 / .NET 10.
 - [ ] 2. Implement public interfaces, models, and exceptions
   - [ ] 2.1 Create processor contract interfaces and MessageContext
     - Create `IMessageProcessor<TMessage>` interface with `ProcessAsync(TMessage message, MessageContext context, CancellationToken ct)` method
-    - Create `IRpcProcessor<TRequest, TResponse>` interface with `ProcessAsync(TRequest request, MessageContext context, CancellationToken ct)` returning `Task<TResponse>`
+    - Create `IRpcProcessor<TRequest, TResponse>` interface (constraint `TResponse : RpcResponse`) with `ProcessAsync(TRequest request, MessageContext context, CancellationToken ct)` returning `Task<TResponse>`
     - Create `MessageContext` sealed record with MessageId, CorrelationId, Timestamp, Pattern, Headers properties
     - _Requirements: 1.2, 2.2, 3.5_
+
+  - [ ] 2.1a Create the RPC response contract
+    - Create `RpcResponse` abstract record with `RpcError? Error` (init-only) and computed `bool Success => Error is null`
+    - Create `RpcError` sealed record with `required string Code` and `required string Message`
+    - Both live in the core `MqCSFramework` namespace so senders and consumers reference them
+    - _Requirements: 2.9_
 
   - [ ] 2.2 Create sender interfaces
     - Create `IStandardSender` interface with `SendAsync<TProcessor, TMessage>(TMessage message, SendOptions? options, CancellationToken ct)` returning `Task<string>`
     - Create `IRpcSender` interface with `SendAsync<TProcessor, TResponse, TRequest>(TRequest request, RpcOptions? options, CancellationToken ct)` returning `Task<TResponse>`
-    - Enforce generic constraints: `TProcessor : IMessageProcessor<TMessage>` and `TProcessor : IRpcProcessor<TRequest, TResponse>`
+    - Enforce generic constraints: `TProcessor : IMessageProcessor<TMessage>`; and `TProcessor : IRpcProcessor<TRequest, TResponse>` with `TResponse : RpcResponse`
     - _Requirements: 1.1, 1.2, 2.1, 2.2_
 
   - [ ] 2.3 Create configuration options classes
@@ -40,10 +46,10 @@ The implementation language is C# 14 / .NET 10.
     - _Requirements: 4.1, 5.2, 5.3, 5.4, 8.3, 8.4, 9.3_
 
   - [ ] 2.4 Create exception types
-    - Create `RpcTimeoutException` with CorrelationId and Timeout properties
-    - Create `RpcRemoteException` with CorrelationId and RemoteExceptionType properties
+    - Create `RpcTimeoutException` with CorrelationId and Timeout properties (client-side timeout; unchanged)
     - Create `MessageSerializationException` with MessageId property
-    - _Requirements: 2.7, 2.8, 7.2_
+    - Do NOT create an `RpcRemoteException` — remote processor exceptions are never sent to the sender
+    - _Requirements: 2.8, 7.2_
 
 - [ ] 3. Implement connection management
   - [ ] 3.1 Create RabbitMqConnection internal class
@@ -79,21 +85,21 @@ The implementation language is C# 14 / .NET 10.
     - Accept `RabbitMqConnection` and `RpcSenderOptions` via constructor
     - Maintain a `ConcurrentDictionary<string, TaskCompletionSource<byte[]>>` for pending RPC calls
     - Set up a Direct Reply-to consumer on the connection's channel to receive responses
-    - On send: serialize request, set headers (`mq-processor-type`, `mq-pattern` = "rpc"), set `ReplyTo` = "amq.rabbitmq.reply-to", publish
+    - On send: serialize request, set headers (`mq-processor-type`, `mq-pattern` = "rpc"), set `ReplyTo` = reply queue, publish
     - Await response with configurable timeout; throw `RpcTimeoutException` on expiry
-    - Deserialize response envelope; throw `RpcRemoteException` if `IsError` is true
+    - Deserialize the reply bytes directly into `TResponse` (no envelope); return it. Business failure is read from `TResponse.Error`, not thrown
     - Implement `HandleReply` method called by the reply consumer
-    - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.7, 2.8_
+    - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.8, 2.9_
 
   - [ ]* 5.2 Write property test for RPC round-trip correlation
     - **Property 4: RPC Round-Trip Correlation**
     - Generate random CorrelationIds and response objects, simulate response delivery via HandleReply, verify the sender receives the correctly deserialized TResponse matching the CorrelationId
     - **Validates: Requirements 2.5, 2.6**
 
-  - [ ]* 5.3 Write property test for RPC error propagation
-    - **Property 5: RPC Error Propagation**
-    - Generate random exception messages, simulate error response via HandleReply with IsError=true, verify RpcRemoteException is thrown containing the original error message
-    - **Validates: Requirements 2.8**
+  - [ ]* 5.3 Write property test for RPC business failure round-trip
+    - **Property 5: RPC Business Failure Round-Trip**
+    - Generate random `RpcError` values, build a `TResponse` with `Error` set, simulate reply delivery via HandleReply, verify the sender returns the same `TResponse` with `Error` intact and `Success == false` (no exception thrown)
+    - **Validates: Requirements 2.9**
 
 - [ ] 6. Checkpoint - Verify sender implementations
   - Ensure all tests pass, ask the user if questions arise.
@@ -104,16 +110,11 @@ The implementation language is C# 14 / .NET 10.
     - Implement `StartAsync`: create connection, create channel, set BasicQos (prefetchCount), register `AsyncEventingBasicConsumer`, subscribe to `ReceivedAsync`, call `BasicConsumeAsync` with `autoAck: false`
     - Implement `DispatchMessage`: read `mq-processor-type` header → `Type.GetType` → resolve from DI → deserialize body → call `ProcessAsync`
     - For standard pattern: ACK on success, handle failures per retry logic
-    - For RPC pattern: call ProcessAsync, serialize `RpcResponseEnvelope` (success or error), publish to ReplyTo queue, ACK
+    - For RPC pattern: call ProcessAsync to get serialized `TResponse` bytes, publish them directly to the ReplyTo queue, ACK. Do NOT catch processor exceptions here — let them propagate to the shared failure path (retry/dead-letter); no reply is sent on an unexpected exception
     - Handle missing headers (NACK without requeue), unresolvable types (NACK without requeue), deserialization failures (NACK without requeue)
     - Track retry count via `mq-retry-count` header; dead-letter when count >= MaxRetries
     - Implement `IAsyncDisposable` for graceful channel/connection close
     - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3_
-
-  - [ ] 7.2 Create RpcResponseEnvelope internal record
-    - Properties: `IsError`, `Payload` (byte[]), `ErrorMessage`, `ErrorType`
-    - Used by consumer to wrap processor results/errors before publishing to reply queue
-    - _Requirements: 2.5, 2.8_
 
   - [ ]* 7.3 Write property test for consumer dispatch correctness
     - **Property 3: Consumer Dispatch Correctness**
@@ -182,7 +183,7 @@ The implementation language is C# 14 / .NET 10.
     - _Requirements: 1.1, 2.1, 5.1, 5.2, 5.3, 5.5_
 
   - [ ] 11.3 Create samples/MqCSFramework.Samples.Consumer console app
-    - Register processor implementations as DI singletons
+    - Register processor implementations as Scoped DI services
     - Configure `AddMqCSFramework` with consumers for orders and stock queues
     - Implement `OrderProcessor` (standard) and `StockProcessor` (RPC)
     - Run as hosted service
@@ -199,9 +200,10 @@ The implementation language is C# 14 / .NET 10.
   - [ ] 12.2 Write integration tests for RPC flow
     - Use the same Testcontainers RabbitMQ instance
     - Send an RPC request via `IRpcSender`, have a consumer process it and return a response, verify the sender receives the correct typed response
+    - Test business failure: processor returns a `TResponse` with `Error` set → sender receives it with `Success == false` and `Error` intact (no exception)
     - Test timeout behavior (no consumer, short timeout → `RpcTimeoutException`)
-    - Test error propagation (processor throws → `RpcRemoteException` at sender)
-    - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.7, 2.8_
+    - Test unexpected exception: processor throws → no reply published, message dead-lettered after retries, sender observes `RpcTimeoutException`
+    - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.8, 2.9, 2.10, 9.4_
 
   - [ ] 12.3 Write integration test for dead-letter routing
     - Configure a consumer with MaxRetries = 2 and a dead-letter exchange
@@ -229,11 +231,11 @@ The implementation language is C# 14 / .NET 10.
 {
   "waves": [
     { "id": 0, "tasks": ["1.1"] },
-    { "id": 1, "tasks": ["2.1", "2.2", "2.3", "2.4"] },
+    { "id": 1, "tasks": ["2.1", "2.1a", "2.2", "2.3", "2.4"] },
     { "id": 2, "tasks": ["3.1"] },
     { "id": 3, "tasks": ["4.1", "5.1"] },
     { "id": 4, "tasks": ["4.2", "4.3", "5.2", "5.3"] },
-    { "id": 5, "tasks": ["7.1", "7.2", "8.1"] },
+    { "id": 5, "tasks": ["7.1", "8.1"] },
     { "id": 6, "tasks": ["7.3", "7.4", "7.5", "8.2"] },
     { "id": 7, "tasks": ["9.1"] },
     { "id": 8, "tasks": ["9.2", "9.3"] },

@@ -13,7 +13,7 @@ public interface IRpcProcessor
 /// Generic interface for RPC processors that return a typed response.
 /// Define a contract interface inheriting this in your shared contracts package.
 /// </summary>
-public interface IRpcProcessor<in TRequest, TResponse> : IRpcProcessor where TRequest : class where TResponse : class
+public interface IRpcProcessor<in TRequest, TResponse> : IRpcProcessor where TRequest : class where TResponse : RpcResponse
 {
     Task<TResponse> ProcessAsync(TRequest request, MessageContext context, CancellationToken ct = default);
 }

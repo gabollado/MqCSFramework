@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -9,19 +10,19 @@ namespace MqCSFramework.Consumer.Internal;
 internal sealed class ConsumerHostedService : BackgroundService
 {
     private readonly IReadOnlyList<ConsumerRegistration> _registrations;
-    private readonly IServiceProvider _serviceProvider;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<ConsumerHostedService> _logger;
     private readonly List<MqConsumer> _consumers = [];
 
     public ConsumerHostedService(
         IEnumerable<ConsumerRegistration> registrations,
-        IServiceProvider serviceProvider,
+        IServiceScopeFactory scopeFactory,
         ILoggerFactory loggerFactory,
         ILogger<ConsumerHostedService> logger)
     {
         _registrations = registrations.ToList();
-        _serviceProvider = serviceProvider;
+        _scopeFactory = scopeFactory;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -39,7 +40,7 @@ internal sealed class ConsumerHostedService : BackgroundService
 
         foreach (var reg in _registrations)
         {
-            var consumer = new MqConsumer(reg.Options, _serviceProvider, _loggerFactory.CreateLogger<MqConsumer>());
+            var consumer = new MqConsumer(reg.Options, _scopeFactory, _loggerFactory.CreateLogger<MqConsumer>());
             _consumers.Add(consumer);
 
             await consumer.StartAsync(stoppingToken);

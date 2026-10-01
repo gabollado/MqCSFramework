@@ -5,7 +5,7 @@
 MqCSFramework is a **three-module** RabbitMQ-only messaging framework. It provides compile-time type-safe sending via processor contract interfaces, automatic consumer dispatch using dependency injection resolution from message headers, and independent connection management per sender/consumer.
 
 The three modules are:
-- **MqCSFramework** — Core/shared: interfaces, models, exceptions, connection management, RPC response envelope
+- **MqCSFramework** — Core/shared: interfaces, models, exceptions, connection management, RPC response contract (`RpcResponse`/`RpcError`)
 - **MqCSFramework.Sender** — Standard and RPC sender implementations, DI registration extensions
 - **MqCSFramework.Consumer** — Consumer implementation, abstract processor base classes, DI registration extensions
 
@@ -45,13 +45,13 @@ src/
 │   ├── MqHeaders                           ← Well-known header name constants
 │   ├── Configuration/
 │   │   └── RabbitMqConnectionOptions       ← Connection settings (host, port, credentials, SSL)
+│   ├── RpcResponse                         ← Abstract base record all RPC responses extend (Error + derived Success)
+│   ├── RpcError                            ← Error value object (Code + Message)
 │   ├── Exceptions/
 │   │   ├── MessageSerializationException
-│   │   ├── RpcRemoteException
 │   │   └── RpcTimeoutException
 │   └── Internal/
-│       ├── RabbitMqConnection              ← Lazy connection/channel management with auto-recovery
-│       └── RpcResponseEnvelope             ← Wire format for RPC responses
+│       └── RabbitMqConnection              ← Lazy connection/channel management with auto-recovery
 │
 ├── MqCSFramework.Sender/                   ← Sender module
 │   ├── IStandardSender                     ← Public interface for fire-and-forget sends
@@ -147,12 +147,12 @@ Consumer side:
 5. Sets `ReplyTo` = reply queue name (format: `{routingKey}.reply.{GUID:N}`)
 6. `RpcRequestResponseHandler` lazily declares the exclusive auto-delete reply queue, starts consuming
 7. Registers a pending completion source keyed by `correlationId`, publishes, awaits response
-8. On timeout: `RpcTimeoutException` (via linked cancellation with timeout)
-9. Consumer receives, resolves processor, calls `ProcessRawRpcAsync` which returns serialized response bytes
-10. Consumer wraps in `RpcResponseEnvelope`, publishes to `ReplyTo` queue with matching `CorrelationId`
+8. On timeout: `RpcTimeoutException` (via linked cancellation with timeout). Timeout is a client-side concern — the sender stopped waiting
+9. Consumer receives, resolves processor, calls `ProcessRawRpcAsync` which returns the serialized `TResponse` bytes
+10. Consumer publishes those bytes directly to the `ReplyTo` queue with matching `CorrelationId` (no wrapping envelope)
 11. Cancellation token for RPC processing: created from `mq-cancellation-deadline` header (remaining time until deadline)
-12. If processor throws: consumer wraps error in `RpcResponseEnvelope` with `IsError = true`
-13. Sender deserializes envelope → throws `RpcRemoteException` if `IsError`, else deserializes `TResponse`
+12. If the processor throws an unexpected exception: nothing is published to the reply queue. The failure follows the standard NACK/retry/dead-letter path (see Error Handling). The sender observes a timeout
+13. Sender deserializes the reply bytes directly into `TResponse` (which extends `RpcResponse`). Business success/failure is read from `TResponse.Success`/`TResponse.Error` — set by the processor, not signaled by an exception
 
 ## Components and Interfaces
 
@@ -205,7 +205,7 @@ Returns: asynchronous method returning byte array (the serialized response)
 
 Generic interface for RPC processors that return a typed response. Define a contract interface inheriting this in your shared contracts module.
 
-- Type constraints: `TRequest` must be a reference type (class), `TResponse` must be a reference type (class)
+- Type constraints: `TRequest` must be a reference type (class), `TResponse` must extend `RpcResponse`
 
 ```
 Method: ProcessAsync
@@ -302,32 +302,31 @@ Constructor parameters:
 Message format: "RPC call {correlationId} timed out after {timeout.TotalSeconds}s"
 ```
 
-**Class: RpcRemoteException** (final/non-inheritable, extends base exception)
+Note: there is intentionally no `RpcRemoteException`. Remote processors do not send exceptions back to the sender. Business failures are expressed as an `RpcError` on the response (see `RpcResponse` below); unexpected processor exceptions follow the standard NACK/retry/dead-letter path and surface to the sender only as a timeout.
 
-Thrown when the remote processor threw an exception during RPC processing.
+#### RpcResponse (Public, abstract)
+
+Abstract base record that every RPC response type MUST extend. Carries the operation outcome. The concrete response record adds its own payload members. Lives in the core module so both consumer (processors) and sender (callers) reference it.
 
 ```
+Abstract record: RpcResponse
 Properties:
-  - CorrelationId: string
-  - RemoteExceptionType: string (default "Unknown")
-Constructor parameters:
-  - correlationId: string
-  - message: string
-  - remoteExceptionType: string or null (optional)
-Message format: "Remote processor error for {correlationId}: {message}"
+  - Error: RpcError or null (init-only) - null on success, populated on business failure
+  - Success: boolean (computed, get-only) - defined as (Error is null); NOT settable, NOT independently serialized
+Behavior:
+  Success is derived from Error so the two can never disagree. A processor signals failure
+  purely by setting Error; leaving Error null means success.
 ```
 
-#### RpcResponseEnvelope (Internal)
+#### RpcError (Public)
 
-Internal data class used by both sender (deserialization) and consumer (serialization). Shared across modules via internal visibility.
+Immutable value object describing a business failure. Both members are required together, so a partially-populated error state cannot exist.
 
 ```
-Data class: RpcResponseEnvelope (immutable, internal)
+Sealed record: RpcError
 Properties:
-  - IsError: boolean (required) - true if the processor threw an exception
-  - Payload: byte array or null - serialized TResponse bytes (success only)
-  - ErrorMessage: string or null - exception message (error only)
-  - ErrorType: string or null - exception type full name (error only)
+  - Code: string (required) - machine-readable, service-specific error code (e.g. "SKU_NOT_FOUND"). Not a framework enum
+  - Message: string (required) - human-readable description for logs/diagnostics
 ```
 
 #### RabbitMqConnection (Internal)
@@ -401,14 +400,14 @@ Interface: IRpcSender
 Method: SendAsync
 Type parameters:
   - TProcessor (must implement IRpcProcessor<TRequest, TResponse>)
-  - TResponse (must be a reference type / class)
+  - TResponse (must extend RpcResponse)
   - TRequest (must be a reference type / class)
 Parameters:
   - request: TRequest - the request to send
   - correlationId: string - mandatory correlation identifier
   - options: RpcOptions (optional, default null) - per-message overrides
   - cancellationToken: cancellation token (optional, default none)
-Returns: asynchronous method returning TResponse (the deserialized response)
+Returns: asynchronous method returning TResponse (the deserialized response; inspect Success/Error for business outcome)
 ```
 
 #### Configuration Options (Sender)
@@ -586,12 +585,9 @@ SendAsync behavior:
   6. Merge any AdditionalHeaders from options into the headers
   7. Log info: publishing RPC request with messageId, processor name, exchange, routingKey
   8. Call replyConsumer.PublishAndAwaitReplyAsync(exchange, routingKey, props, body, correlationId, timeout, ct)
-  9. Deserialize response bytes as RpcResponseEnvelope
-  10. If envelope.IsError is true: throw RpcRemoteException(correlationId, errorMessage, errorType)
-  11. If envelope.Payload is null: throw MessageSerializationException("payload was null", messageId)
-  12. Deserialize envelope.Payload as TResponse
-  13. If deserialized response is null: throw MessageSerializationException("failed to deserialize", messageId)
-  14. Return the deserialized TResponse
+  9. Deserialize the response bytes directly as TResponse (no envelope)
+  10. If the deserialized response is null: throw MessageSerializationException("failed to deserialize", messageId)
+  11. Return the deserialized TResponse (caller inspects Success/Error for the business outcome)
 
 DisposeAsync behavior:
   Disposes the reply consumer, then disposes the connection.
@@ -712,7 +708,7 @@ Returns: asynchronous completion (void)
 
 Implements `IRpcProcessor<TRequest, TResponse>`. Handles deserialization and response serialization internally — the consumer calls `ProcessRawRpcAsync` directly (no reflection).
 
-- Type constraints: `TRequest` must be a reference type (class), `TResponse` must be a reference type (class)
+- Type constraints: `TRequest` must be a reference type (class), `TResponse` must extend `RpcResponse`
 
 ```
 Method: ProcessRawRpcAsync (concrete implementation)
@@ -785,13 +781,13 @@ Class: ConsumerHostedService
 Extends: background/hosted service base class
 Fields:
   - registrations: read-only list of ConsumerRegistration
-  - serviceProvider: DI service provider
+  - scopeFactory: IServiceScopeFactory
   - loggerFactory: logger factory
   - logger: logger instance
   - consumers: mutable list of MqConsumer
 Constructor parameters:
   - registrations: collection of ConsumerRegistration (injected from DI)
-  - serviceProvider: DI service provider
+  - scopeFactory: IServiceScopeFactory
   - loggerFactory: logger factory
   - logger: logger instance
 
@@ -799,7 +795,7 @@ Execute behavior (runs on background thread):
   1. If no registrations: log warning "No consumers registered", idle indefinitely until cancellation, return
   2. Log info "Starting {Count} consumer(s)"
   3. For each registration:
-     - Create a new MqConsumer with registration.Options, serviceProvider, and a new logger
+     - Create a new MqConsumer with registration.Options, scopeFactory, and a new logger
      - Add to consumers list
      - Call consumer.StartAsync(cancellationToken)
   4. Log info "All consumers started"
@@ -810,14 +806,14 @@ Execute behavior (runs on background thread):
 
 #### MqConsumer (Internal)
 
-Manages a single consumer — owns its connection, channel, and message dispatch loop. Resolves processors directly from DI using the `mq-processor-type` header. Final/non-inheritable, internal. Implements async disposable/cleanup pattern.
+Manages a single consumer — owns its connection, channel, and message dispatch loop. Resolves processors from a per-message DI scope using the `mq-processor-type` header, ensuring scoped dependencies (e.g. DbContext) are not shared across messages. Final/non-inheritable, internal. Implements async disposable/cleanup pattern.
 
 ```
 Class: MqConsumer
 Implements: async disposable/cleanup pattern
 Fields:
   - options: ConsumerOptions
-  - serviceProvider: DI service provider
+  - scopeFactory: IServiceScopeFactory
   - logger: logger instance
   - maskedFields: set of strings (case-insensitive) or null
     Built from options.MaskedFields if non-empty, null otherwise.
@@ -825,7 +821,7 @@ Fields:
   - channel: channel object or null
 Constructor parameters:
   - options: ConsumerOptions
-  - serviceProvider: DI service provider
+  - scopeFactory: IServiceScopeFactory
   - logger: logger instance
 
 Method: StartAsync
@@ -856,14 +852,20 @@ Behavior:
 Dispatch logic:
 1. Read `mq-processor-type` header → if missing, log warning + NACK without requeue, return
 2. Resolve type by name from the header value → if null (type not found), log error + NACK without requeue, return
-3. Resolve service from DI using the resolved type → if null (not registered), log error + NACK without requeue, return
-4. Read `mq-pattern` header → if missing, log warning + NACK without requeue, return
-5. Log message body at debug level (masked if `MaskedFields` configured)
-6. Build `MessageContext` via `MessageHelpers.BuildContext(...)`
-7. Dispatch based on pattern value:
+3. Create a new DI scope via `scopeFactory.CreateScope()` (disposed when message processing finishes)
+4. Resolve service from the scoped provider using the resolved type → if null (not registered), log error + NACK without requeue, return
+5. Read `mq-pattern` header → if missing, log warning + NACK without requeue, return
+6. Log message body at debug level (masked if `MaskedFields` configured)
+7. Build `MessageContext` via `MessageHelpers.BuildContext(...)`
+8. Dispatch based on pattern value:
    - `"standard"`: call DispatchStandardAsync
    - `"rpc"`: call DispatchRpcAsync
-8. On unhandled exception during processing: call HandleFailureAsync
+9. On unhandled exception during processing: call HandleFailureAsync
+
+Note: The scope-per-message pattern ensures that scoped dependencies (e.g. DbContext) get a fresh
+instance per message and are deterministically disposed after processing. Processors should be
+registered as Scoped so they (and their dependencies) are isolated per message. Singletons are
+unaffected (shared across all scopes). This mirrors what ASP.NET Core does per HTTP request.
 
 **Method: DispatchStandardAsync** (private)
 
@@ -882,17 +884,18 @@ Behavior:
 Behavior:
   1. Cast processor to IRpcProcessor (non-generic)
      - If cast fails: log error, NACK without requeue, return
-  2. Try: call processor.ProcessRawRpcAsync(body, context, rpcTimeoutToken)
-     - On success: create RpcResponseEnvelope with IsError=false, Payload=responseBytes
-     - On exception: log error, create RpcResponseEnvelope with IsError=true,
-       ErrorMessage=(innerException ?? exception).Message,
-       ErrorType=(innerException ?? exception).TypeFullName
+  2. Call processor.ProcessRawRpcAsync(body, context, rpcTimeoutToken) to get the serialized TResponse bytes.
+     This is NOT wrapped in a try/catch here — an unexpected exception propagates to the caller
+     (DispatchMessageCoreAsync), which routes it to HandleFailureAsync (NACK/retry/dead-letter).
+     No reply is published on failure; the sender will time out.
   3. Read ReplyTo from message properties
   4. If ReplyTo is not empty:
-     - Serialize the envelope to UTF-8 JSON bytes
      - Create reply properties: CorrelationId=original message's CorrelationId, ContentType="application/json"
-     - Publish to exchange="" (default), routingKey=ReplyTo
+     - Publish the serialized TResponse bytes directly to exchange="" (default), routingKey=ReplyTo
   5. ACK the original message
+
+Note: business failures are NOT exceptions. The processor returns a TResponse with its Error
+property set, which serializes and travels back like any successful response.
 ```
 
 **Cancellation token creation:**
@@ -926,21 +929,21 @@ Parameters:
   - messageId: string
 Behavior:
   1. Read current retry count from headers via MessageHelpers.GetRetryCount (0 if not present)
-  2. If MaxRetries > 0 AND retryCount >= MaxRetries:
-     a. If DeadLetterExchange is configured (not null/empty):
-        - Log warning: "Message {MessageId} exceeded max retries. Routing to dead-letter."
-        - Create new properties copying: MessageId, CorrelationId, ContentType, Headers from original
-        - Publish to DeadLetterExchange with DeadLetterRoutingKey (or "" if null)
-        - ACK the original message
-        - Return
-     b. Otherwise: NACK without requeue, return
-  3. If under retry limit:
+  2. If retries NOT exhausted (MaxRetries <= 0 OR retryCount < MaxRetries):
      - Copy all headers from original (or create empty dictionary if none)
      - Set "mq-retry-count" = retryCount + 1
      - Create new properties copying: MessageId, CorrelationId, Timestamp, ContentType, ReplyTo, Headers
      - Republish to the same exchange/routing key as the original
      - ACK the original message
      - Log warning: "Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued."
+     - Return
+  3. If DeadLetterExchange is configured (not null/empty):
+     - Log warning: "Message {MessageId} exceeded max retries. Routing to dead-letter."
+     - Create new properties copying: MessageId, CorrelationId, ContentType, Headers from original
+     - Publish to DeadLetterExchange with DeadLetterRoutingKey (or "" if null)
+     - ACK the original message
+     - Return
+  4. Otherwise: NACK without requeue
 ```
 
 **Body logging:**
@@ -1059,38 +1062,25 @@ Messages on the wire have this structure:
 | Property: `ReplyTo` | Reply queue name (RPC only, format: `{routingKey}.reply.{GUID:N}`) |
 | Property: `ContentType` | `"application/json"` |
 
-### RPC Response Envelope
+### RPC Response Wire Format
 
-For RPC responses published back to the reply queue:
+There is no wrapping envelope. The serialized `TResponse` is published directly to the reply queue. Because `TResponse` extends `RpcResponse`, the outcome fields travel inline with the payload.
 
-```
-Data class: RpcResponseEnvelope (immutable, internal)
-Properties:
-  - IsError: boolean (required) - true if the processor threw
-  - Payload: byte array or null - serialized TResponse bytes (success only)
-  - ErrorMessage: string or null - exception message (error only)
-  - ErrorType: string or null - exception type full name (error only)
-```
-
-When a processor throws, the consumer serializes:
+On business success (`Error` omitted, `Success` derives to true on the receiver):
 ```json
 {
-  "IsError": true,
-  "Payload": null,
-  "ErrorMessage": "Order not found",
-  "ErrorType": "System.InvalidOperationException"
+  "quantity": 42
 }
 ```
 
-On success:
+On business failure (processor set `Error` on the response):
 ```json
 {
-  "IsError": false,
-  "Payload": "<base64-encoded TResponse JSON bytes>",
-  "ErrorMessage": null,
-  "ErrorType": null
+  "error": { "code": "SKU_NOT_FOUND", "message": "No stock record for SKU ABC-123" }
 }
 ```
+
+`Success` is a computed property on `RpcResponse` (`Error is null`) and is not written to the wire; the receiver recomputes it after deserialization. An unexpected processor exception produces no reply at all (the sender times out).
 
 ### Dead Letter Tracking
 
@@ -1153,9 +1143,13 @@ services.AddMqConsumersFromConfiguration(configuration, "CustomSection")
 
 ### Processor Registration (standard DI by the developer)
 
+Processors are registered by the developer in the DI container. Scoped is the recommended lifetime
+so each message gets a fresh processor instance (and fresh scoped dependencies like DbContext).
+Singleton and Transient are also supported depending on the use case.
+
 ```
-services.RegisterSingleton(IOrderProcessor → OrderProcessor)
-services.RegisterSingleton(IStockProcessor → StockProcessor)
+services.RegisterScoped(IOrderProcessor → OrderProcessor)
+services.RegisterScoped(IStockProcessor → StockProcessor)
 ```
 
 ### Resolving Senders (keyed/named DI)
@@ -1266,15 +1260,13 @@ When the standard sender encounters a publish failure (exception other than `Mes
 3. Re-throws the exception
 4. Next send attempt will create a fresh channel via `GetChannelAsync`
 
-### RPC Error Propagation
+### RPC Error Handling
 
-When an RPC processor throws:
-1. Consumer catches the exception
-2. Takes `innerException ?? exception` as the error source
-3. Wraps in `RpcResponseEnvelope { IsError = true, ErrorMessage = innerEx.Message, ErrorType = innerEx.TypeFullName }`
-4. Publishes to the reply queue
-5. ACKs the original message
-6. Sender deserializes the envelope, detects `IsError = true`, throws `RpcRemoteException(correlationId, errorMessage, errorType)`
+Two distinct cases:
+
+**Business failure (expected):** the processor returns a `TResponse` with `Error` set to an `RpcError`. This serializes and travels back to the sender like any response. The sender returns the `TResponse`; the caller checks `response.Success` / `response.Error`. No exception anywhere.
+
+**Unexpected processor exception:** the consumer does NOT catch it in `DispatchRpcAsync`. It propagates to `DispatchMessageCoreAsync` → `HandleFailureAsync`, which applies the standard NACK/retry/dead-letter policy — identical to a standard-message failure. Nothing is published to the reply queue, so the sender's pending call ultimately fails with `RpcTimeoutException`. There is no `RpcRemoteException`; remote exception details are never transmitted to the sender.
 
 ### Logging
 
@@ -1320,11 +1312,17 @@ When an RPC processor throws:
 
 **Validates: Requirements 2.5, 2.6**
 
-### Property 5: RPC Error Propagation
+### Property 5: RPC Business Failure Round-Trip
 
-*For any* RPC request where the processor throws an exception, the sender SHALL receive an `RpcRemoteException` containing the original exception's message.
+*For any* RPC request where the processor returns a `TResponse` with `Error` set, the sender SHALL receive that same `TResponse` with `Error.Code` and `Error.Message` intact and `Success` equal to false. No exception is thrown.
 
-**Validates: Requirements 2.8**
+**Validates: Requirements 2.9**
+
+### Property 5b: Unexpected Processor Exception Does Not Reach Sender
+
+*For any* RPC request where the processor throws an unexpected exception, the consumer SHALL NOT publish any reply, SHALL apply the standard failure policy (retry/dead-letter), and the sender SHALL observe `RpcTimeoutException` (never `RpcRemoteException`, which does not exist).
+
+**Validates: Requirements 2.10, 9.4**
 
 ### Property 6: Processor Fault Tolerance
 
@@ -1391,15 +1389,15 @@ src/
 │   ├── LoggingExtensions.cs
 │   ├── MessageContext.cs
 │   ├── MqHeaders.cs
+│   ├── RpcResponse.cs
+│   ├── RpcError.cs
 │   ├── Configuration/
 │   │   └── RabbitMqConnectionOptions.cs
 │   ├── Exceptions/
 │   │   ├── MessageSerializationException.cs
-│   │   ├── RpcRemoteException.cs
 │   │   └── RpcTimeoutException.cs
 │   └── Internal/
-│       ├── RabbitMqConnection.cs
-│       └── RpcResponseEnvelope.cs
+│       └── RabbitMqConnection.cs
 │
 ├── MqCSFramework.Sender/
 │   ├── MqCSFramework.Sender.csproj
@@ -1576,7 +1574,7 @@ src/
 
 **Record Types:**
 - `MessageContext` is a `sealed record` (immutable value semantics)
-- `RpcResponseEnvelope` is a `sealed record` (internal)
+- `RpcResponse` is an `abstract record` (public base for all RPC responses); `RpcError` is a `sealed record` (public)
 - `ConsumerRegistration` is a `sealed record` (internal)
 
 **Sealed Classes:**

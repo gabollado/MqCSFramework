@@ -1,26 +1,32 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using MqCSFramework;
 using MqCSFramework.Consumer;
-using MqCSFramework.Samples.Consumer;
 using MqCSFramework.Samples.Contracts;
 using Serilog;
 
-var builder = Host.CreateApplicationBuilder(args);
+namespace MqCSFramework.Samples.Consumer;
 
-// Load local config override (git-ignored, contains connection credentials)
-builder.Configuration.AddJsonFile("appsettings.local.json", optional: true, reloadOnChange: false);
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var builder = Host.CreateApplicationBuilder(args);
 
-// Configure Serilog from appsettings.json
-builder.Services.AddSerilog(config => config.ReadFrom.Configuration(builder.Configuration));
+        // Load local config override (git-ignored, contains connection credentials)
+        builder.Configuration.AddJsonFile("appsettings.local.json", optional: true, reloadOnChange: false);
 
-// Register processors as standard DI singletons
-builder.Services.AddSingleton<IOrderProcessor, OrderProcessor>();
-builder.Services.AddSingleton<IStockProcessor, StockProcessor>();
+        // Configure Serilog from appsettings.json
+        builder.Services.AddSerilog(config => config.ReadFrom.Configuration(builder.Configuration));
 
-// Configure MqCSFramework consumers from appsettings.json
-builder.Services.AddMqConsumersFromConfiguration(builder.Configuration);
+        // Register processors as scoped DI services (one instance per message scope)
+        builder.Services.AddScoped<IOrderProcessor, OrderProcessor>();
+        builder.Services.AddScoped<IStockProcessor, StockProcessor>();
 
-Console.WriteLine("[Consumer] Starting...");
-await builder.Build().RunAsync();
+        // Configure MqCSFramework consumers from appsettings.json
+        builder.Services.AddMqConsumersFromConfiguration(builder.Configuration);
+
+        Console.WriteLine("[Consumer] Starting...");
+        await builder.Build().RunAsync();
+    }
+}

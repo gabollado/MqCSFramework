@@ -19,7 +19,7 @@ This rule exists because the developer WILL delete all code and regenerate from 
 
 - The project uses RabbitMQ only — no transport abstraction layer
 - Three NuGet packages: `MqCSFramework` (core/shared), `MqCSFramework.Sender`, `MqCSFramework.Consumer`
-- Processors are registered as standard DI singletons by the developer
+- Processors are recommended to be registered as Scoped DI services (one instance per message scope). Singleton and Transient are also supported.
 - Processor implementations inherit from abstract base classes (`StandardProcessor<T>`, `RpcProcessor<TReq, TRes>`) which handle deserialization internally
 - Consumer dispatch uses non-generic base interfaces (`IMessageProcessor.ProcessRawAsync`, `IRpcProcessor.ProcessRawRpcAsync`) — no reflection, no separate dispatch interfaces
 - The sender specifies the processor contract interface as a generic parameter for compile-time type safety
@@ -27,3 +27,4 @@ This rule exists because the developer WILL delete all code and regenerate from 
 - Two sender interfaces: `IStandardSender` and `IRpcSender`
 - All references to the company (xximo, XXImo) must be excluded from the project
 - Prefer early returns over if/else chains — if a branch ends with return, throw, or exits, don't use else
+- Prefer inverting conditions when the shorter/simpler branch can return early, keeping the longer logic at the top level to reduce nesting
