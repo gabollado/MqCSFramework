@@ -36,20 +36,50 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
         where TRequest : class
         where TResponse : RpcResponse
     {
-        var messageId = Guid.NewGuid().ToString("N");
         var routingKey = options?.RoutingKey ?? _options.RoutingKey;
-        var timeout = options?.Timeout ?? _options.Timeout;
+        var timeout = TimeSpan.FromMilliseconds(options?.TimeoutMs ?? _options.TimeoutMs);
+        var maxExceptionRetries = options?.MaxExceptionRetries ?? _options.MaxExceptionRetries;
+        var exceptionRetryDelayMs = options?.ExceptionRetryDelayMs ?? _options.ExceptionRetryDelayMs;
 
-        byte[] body;
-        try
+        var body = JsonSerializer.SerializeToUtf8Bytes(request);
+
+        var attempt = 0;
+        
+        do
         {
-            body = JsonSerializer.SerializeToUtf8Bytes(request);
+            try
+            {
+                attempt++;
+                return await SendAttemptAsync<TProcessor, TResponse, TRequest>(
+                    body, correlationId, routingKey, timeout, options, attempt, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException && attempt <= maxExceptionRetries)
+            {
+                _logger.LogWarning(ex,
+                    "RPC request for processor {Processor} failed on attempt {Attempt} of {Total}. Retrying in {Delay}ms.",
+                    typeof(TProcessor).Name, attempt, maxExceptionRetries + 1, exceptionRetryDelayMs);
+
+                await Task.Delay(exceptionRetryDelayMs, ct);
+            }
         }
-        catch (JsonException ex)
-        {
-            throw new MessageSerializationException(
-                $"Failed to serialize RPC request of type '{typeof(TRequest).FullName}'.", messageId, ex);
-        }
+        while (attempt <= maxExceptionRetries);
+
+        throw new Exception("Max retries reached");
+    }
+
+    private async Task<TResponse> SendAttemptAsync<TProcessor, TResponse, TRequest>(
+        byte[] body,
+        string correlationId,
+        string routingKey,
+        TimeSpan timeout,
+        RpcOptions? options,
+        int attempt,
+        CancellationToken ct)
+        where TProcessor : IRpcProcessor<TRequest, TResponse>
+        where TRequest : class
+        where TResponse : RpcResponse
+    {
+        var messageId = Guid.NewGuid().ToString("N");
 
         var props = new BasicProperties
         {
@@ -74,21 +104,14 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
             }
         }
 
-        _logger.LogInformation("Publishing RPC request {MessageId} for processor {Processor} to {Exchange}/{RoutingKey}",
-            messageId, typeof(TProcessor).Name, _options.Exchange, routingKey);
+        _logger.LogInformation(
+            "Publishing RPC request {MessageId} for processor {Processor} to {Exchange}/{RoutingKey} (attempt {Attempt})",
+            messageId, typeof(TProcessor).Name, _options.Exchange, routingKey, attempt);
 
         var responseBytes = await _replyConsumer.PublishAndAwaitReplyAsync(
-            _options.Exchange, routingKey, props, body, correlationId, timeout, ct);
+            _options.Exchange, routingKey, props, body, messageId, correlationId, timeout, ct);
 
-        // The reply carries the serialized TResponse directly (no envelope).
-        // Business success/failure is read from TResponse.Success/Error by the caller.
-        var response = JsonSerializer.Deserialize<TResponse>(responseBytes);
-        if (response is null)
-        {
-            throw new MessageSerializationException(
-                $"Failed to deserialize RPC response to type '{typeof(TResponse).FullName}'.", messageId);
-        }
-
+        var response = JsonSerializer.Deserialize<TResponse>(responseBytes) ?? throw new MessageSerializationException($"Failed to deserialize RPC response to type '{typeof(TResponse).FullName}'.", messageId);
         return response;
     }
 

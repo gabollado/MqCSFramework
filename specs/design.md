@@ -142,17 +142,19 @@ Consumer side:
 
 1. Sender calls `IRpcSender.SendAsync<TProcessor, TResponse, TRequest>(request, correlationId)`
 2. Framework serializes request to UTF-8 JSON
-3. Framework generates `MessageId` as a new GUID in "N" format
-4. Framework sets headers: `mq-processor-type`, `mq-pattern` = `"rpc"`, `mq-cancellation-deadline` = `(currentUtcTime + timeout).Ticks` as string
+3. Framework generates a fresh `MessageId` (new GUID in "N" format) for this attempt — this is the unique request/response match key. The caller's `correlationId` is a process-level trace id that may be shared across many messages and is NOT unique per request
+4. Framework sets headers: `mq-processor-type`, `mq-pattern` = `"rpc"`, `mq-cancellation-deadline` = `(currentUtcTime + timeout).Ticks` as string. Sets `MessageId` = the generated match key and `CorrelationId` = the caller's trace id
 5. Sets `ReplyTo` = reply queue name (format: `{routingKey}.reply.{GUID:N}`)
 6. `RpcRequestResponseHandler` lazily declares the exclusive auto-delete reply queue, starts consuming
-7. Registers a pending completion source keyed by `correlationId`, publishes, awaits response
-8. On timeout: `RpcTimeoutException` (via linked cancellation with timeout). Timeout is a client-side concern — the sender stopped waiting
+7. Registers a pending completion source keyed by `MessageId`, publishes, awaits response
+8. On timeout: `RpcTimeoutException` (via linked cancellation with timeout). Timeout is a client-side concern — the sender stopped waiting. If `MaxExceptionRetries > 0`, the sender waits `ExceptionRetryDelay` and resends (with a NEW `MessageId`, same `correlationId`) before giving up (see RabbitMqRpcSender behavior); the final exception is thrown only after all attempts are exhausted
 9. Consumer receives, resolves processor, calls `ProcessRawRpcAsync` which returns the serialized `TResponse` bytes
-10. Consumer publishes those bytes directly to the `ReplyTo` queue with matching `CorrelationId` (no wrapping envelope)
+10. Consumer publishes those bytes directly to the `ReplyTo` queue, echoing the request's `MessageId` back on the reply's `MessageId` (so the sender can match it) and the request's `CorrelationId` on the reply's `CorrelationId` (for trace continuity). No wrapping envelope
 11. Cancellation token for RPC processing: created from `mq-cancellation-deadline` header (remaining time until deadline)
 12. If the processor throws an unexpected exception: nothing is published to the reply queue. The failure follows the standard NACK/retry/dead-letter path (see Error Handling). The sender observes a timeout
-13. Sender deserializes the reply bytes directly into `TResponse` (which extends `RpcResponse`). Business success/failure is read from `TResponse.Success`/`TResponse.Error` — set by the processor, not signaled by an exception
+13. Sender matches the reply to the pending request by `MessageId`, then deserializes the reply bytes directly into `TResponse` (which extends `RpcResponse`). Business success/failure is read from `TResponse.Success`/`TResponse.Error` — set by the processor, not signaled by an exception
+
+**Why match by `MessageId` and not `CorrelationId`:** `correlationId` identifies a logical process/transaction and is intentionally reusable across multiple messages (and across retries of one message), so it is not unique per request. Keying reply matching on it would let two concurrent calls that share a correlation id collide in the pending map (one reply resolving the wrong call). `MessageId` is generated fresh per message and per retry attempt, so it is the only correct match key. `correlationId` is reserved for logging/tracing on both the sender and the consumer.
 
 ## Components and Interfaces
 
@@ -432,7 +434,11 @@ Properties:
   - Connection: RabbitMqConnectionOptions (default new instance)
   - Exchange: string (default "")
   - RoutingKey: string (default "")
-  - Timeout: duration (default 30 seconds)
+  - TimeoutMs: integer milliseconds (default 30000) - how long to wait for an RPC response before timing out
+  - MaxExceptionRetries: integer (default 0) - number of ADDITIONAL attempts after the first on an
+    exceptional failure (timeout, transport/connection error, or response deserialization failure).
+    0 = no retry (preserves original single-attempt behavior).
+  - ExceptionRetryDelayMs: integer milliseconds (default 1000) - delay waited before each retry attempt.
 ```
 
 **Class: SendOptions** (final/non-inheritable)
@@ -452,7 +458,9 @@ Per-message options for RPC sends (override sender defaults).
 ```
 Properties:
   - RoutingKey: string or null - overrides default routing key
-  - Timeout: duration or null - overrides default timeout
+  - TimeoutMs: integer milliseconds or null - overrides sender's TimeoutMs for this call
+  - MaxExceptionRetries: integer or null - overrides sender's MaxExceptionRetries for this call
+  - ExceptionRetryDelayMs: integer milliseconds or null - overrides sender's ExceptionRetryDelayMs for this call
   - AdditionalHeaders: read-only dictionary of string→string or null - extra headers to include
 ```
 
@@ -567,27 +575,82 @@ Constructor behavior:
   Creates a RpcRequestResponseHandler with the connection, reply queue name, and logger.
 
 SendAsync behavior:
-  1. Generate messageId = new GUID in "N" format
-  2. Determine routingKey = options.RoutingKey if provided, else sender's default RoutingKey
-  3. Determine timeout = options.Timeout if provided, else sender's default Timeout
-  4. Serialize request to UTF-8 JSON bytes
-     - On serialization failure: throw MessageSerializationException with messageId
-  5. Build message properties:
-     - MessageId = generated messageId
-     - CorrelationId = the correlationId parameter
-     - ReplyTo = the reply queue name
-     - Timestamp = current UTC time as Unix epoch seconds
-     - ContentType = "application/json"
-     - Headers:
-       - "mq-processor-type" = TProcessor's assembly-qualified type name
-       - "mq-pattern" = "rpc"
-       - "mq-cancellation-deadline" = (currentUtcTime + timeout).Ticks as string
-  6. Merge any AdditionalHeaders from options into the headers
-  7. Log info: publishing RPC request with messageId, processor name, exchange, routingKey
-  8. Call replyConsumer.PublishAndAwaitReplyAsync(exchange, routingKey, props, body, correlationId, timeout, ct)
-  9. Deserialize the response bytes directly as TResponse (no envelope)
-  10. If the deserialized response is null: throw MessageSerializationException("failed to deserialize", messageId)
-  11. Return the deserialized TResponse (caller inspects Success/Error for the business outcome)
+  1. Determine routingKey = options.RoutingKey if provided, else sender's default RoutingKey
+  2. Determine timeout = TimeSpan.FromMilliseconds(options.TimeoutMs ?? sender's TimeoutMs). Options are
+     expressed in integer milliseconds; convert to TimeSpan once here for the internal time math
+     (cancellation deadline, PublishAndAwaitReplyAsync)
+  3. Determine maxExceptionRetries = options.MaxExceptionRetries if provided, else sender's MaxExceptionRetries
+  4. Determine exceptionRetryDelayMs = options.ExceptionRetryDelayMs if provided, else sender's ExceptionRetryDelayMs
+     (kept as integer milliseconds; passed directly to Task.Delay(int, ct))
+  5. Serialize request to UTF-8 JSON bytes ONCE, before the retry loop
+     - On serialization failure: the serializer exception propagates immediately and is never retried
+       (a bad request object fails identically every attempt and never reaches the broker)
+  6. A single attempt is performed by a private helper (SendAttemptAsync) that:
+     a. Generates messageId = new GUID in "N" format (fresh per attempt — this is the match key)
+     b. Builds message properties:
+        - MessageId = generated messageId (unique per attempt; the reply match key)
+        - CorrelationId = the correlationId parameter (stable trace id, reused across attempts and shareable across messages)
+        - ReplyTo = the reply queue name
+        - Timestamp = current UTC time as Unix epoch seconds
+        - ContentType = "application/json"
+        - Headers:
+          - "mq-processor-type" = TProcessor's assembly-qualified type name
+          - "mq-pattern" = "rpc"
+          - "mq-cancellation-deadline" = (currentUtcTime + timeout).Ticks as string (recomputed per attempt)
+        - Merge any AdditionalHeaders from options into the headers
+     c. Logs info: publishing RPC request with messageId, processor name, exchange, routingKey, attempt number
+     d. Calls replyConsumer.PublishAndAwaitReplyAsync(exchange, routingKey, props, body, messageId, correlationId, timeout, ct)
+        (pending is keyed by messageId; correlationId is passed only for timeout-exception context)
+     e. Deserializes the response bytes directly as TResponse (no envelope)
+     f. If the deserialized response is null: throw MessageSerializationException("failed to deserialize", messageId)
+     g. Returns the deserialized TResponse (caller inspects Success/Error for the business outcome)
+
+  7. Retry loop structure — a `while (true)` whose catch filter carries BOTH the retryable check and the
+     retries-remaining check, so there is no separate "final attempt" block to duplicate:
+     ```
+     var attempt = 0;
+     do
+     {
+         try { return await SendAttemptAsync(..., attempt, ct); }
+         // Caught (and retried) ONLY when the failure is exceptional AND retries remain. On the last
+         // attempt, a caller cancellation, or a non-exceptional failure, the exception is NOT caught
+         // and propagates to the caller.
+         catch (Exception ex) when (ex is not OperationCanceledException && attempt < maxExceptionRetries)
+         {
+             log warning (attempt+1 of maxExceptionRetries+1, delayMs);
+             await Task.Delay(exceptionRetryDelayMs, ct);   // honors ct; throws on caller cancel
+             attempt++;
+         }
+     }
+     while (attempt <= maxExceptionRetries);
+     throw new UnreachableException();   // unreachable; satisfies CS0161 (see note below)
+     ```
+     - Total attempts = maxExceptionRetries + 1 (one initial + N retries). When maxExceptionRetries == 0
+       the catch filter is false on the first failure, so there is exactly one attempt.
+     - The `attempt < maxExceptionRetries` guard that decides whether to retry lives in the catch `when`
+       filter (NOT the loop condition). The loop never exits via its `while` condition — it exits only via
+       `return` (success) or a propagated exception — so the trailing `throw new UnreachableException()` is
+       dead code required only to satisfy definite-return analysis (CS0161: not all code paths return a
+       value). This keeps the loop with no trailing final-attempt call and no rethrow-on-last-attempt branch.
+     - Do NOT add an explicit `ct.ThrowIfCancellationRequested()` inside the catch. It is redundant:
+       `await Task.Delay(exceptionRetryDelay, ct)` already throws OperationCanceledException if the caller
+       cancels (now or during the wait), abandoning the retry. Rely on that.
+
+  Retry predicate (`ex is not OperationCanceledException`, inlined directly in the catch `when` filter —
+  do NOT extract it into a helper method): EVERYTHING is retryable EXCEPT a caller-driven cancellation.
+  A timeout surfaces as RpcTimeoutException (retried); a caller cancelling their CancellationToken
+  surfaces as OperationCanceledException (NOT retried, because the caller explicitly asked to stop —
+  retrying would ignore their intent). These are produced as two distinct exceptions by
+  RpcRequestResponseHandler on purpose (see its PublishAndAwaitReplyAsync).
+
+Note on match key, retry correlation, and idempotency:
+  Each attempt uses a fresh messageId as the pending-map key, so a late reply to a prior (already
+  timed-out) attempt finds no pending entry and is discarded by the autoAck reply consumer — it can
+  never resolve the current attempt. The caller's correlationId is reused across attempts purely for
+  tracing and is never used for matching (it is not unique per message). Because a retry resends the
+  SAME request, exception-retry is only safe for idempotent operations: a lost/late reply can cause the
+  consumer to process the request more than once. A business failure (Success=false) is a normal return
+  value (not an exception), so it is handed straight back to the caller and is never retried.
 
 DisposeAsync behavior:
   Disposes the reply consumer, then disposes the connection.
@@ -618,19 +681,23 @@ Parameters:
   - routingKey: string
   - props: message properties
   - body: byte array
-  - correlationId: string
+  - messageId: string - the unique per-message match key (also set on props.MessageId by the sender)
+  - correlationId: string - the process-level trace id (used only for RpcTimeoutException context/logging)
   - timeout: duration
   - cancellationToken: cancellation token
 Returns: asynchronous method returning byte array (the raw response bytes)
 Behavior:
   1. Call EnsureStartedAsync to guarantee the reply consumer is running
   2. Create a new completion source (with RunContinuationsAsynchronously flag)
-  3. Store it in the pending dictionary keyed by correlationId
-  4. Create a linked cancellation source that cancels after the timeout duration
-  5. Register a cancellation callback: on cancellation, remove the pending entry and set RpcTimeoutException
+  3. Store it in the pending dictionary keyed by messageId (NOT correlationId — correlationId is not unique per message)
+  4. Create a linked cancellation source (from the caller's token) that also cancels after the timeout duration
+  5. Register a cancellation callback: remove the pending entry (by messageId), then — if the caller's token
+     caused the cancellation — complete the pending task as canceled (OperationCanceledException); otherwise
+     (the timeout fired) set RpcTimeoutException. This lets callers and the sender's exception-retry logic
+     distinguish a caller cancellation (not retryable) from a timeout (retryable)
   6. Get channel from connection, publish the message
   7. Await the completion source's result
-  8. On failure before completion: remove pending entry, re-throw
+  8. On failure before completion: remove pending entry (by messageId), re-throw
 
 Method: EnsureStartedAsync (private)
 Parameters:
@@ -649,9 +716,11 @@ Behavior:
 
 Method: HandleReplyAsync (private, event handler)
 Behavior:
-  Read correlationId from the incoming message properties.
-  If correlationId is null, ignore.
-  If a pending entry exists for that correlationId, remove it and set the result to the message body bytes.
+  Read messageId from the incoming reply's MessageId property.
+  If messageId is null, ignore.
+  If a pending entry exists for that messageId, remove it and set the result to the message body bytes.
+  (An unmatched reply — e.g. a late reply to an attempt that already timed out and was removed — is
+  silently discarded; the reply consumer uses autoAck.)
 
 Dispose behavior:
   Cancel all pending completion sources.
@@ -890,7 +959,8 @@ Behavior:
      No reply is published on failure; the sender will time out.
   3. Read ReplyTo from message properties
   4. If ReplyTo is not empty:
-     - Create reply properties: CorrelationId=original message's CorrelationId, ContentType="application/json"
+     - Create reply properties: MessageId=original request's MessageId (the match key the sender awaits),
+       CorrelationId=original request's CorrelationId (trace continuity), ContentType="application/json"
      - Publish the serialized TResponse bytes directly to exchange="" (default), routingKey=ReplyTo
   5. ACK the original message
 
@@ -1193,7 +1263,9 @@ rpcSender = services.GetRequiredKeyedService<IRpcSender>("stock")
         },
         "Exchange": "",
         "RoutingKey": "stock-queue",
-        "Timeout": "00:00:10"
+        "TimeoutMs": 10000,
+        "MaxExceptionRetries": 2,
+        "ExceptionRetryDelayMs": 1000
       }
     },
     "Consumers": {
@@ -1323,6 +1395,12 @@ Two distinct cases:
 *For any* RPC request where the processor throws an unexpected exception, the consumer SHALL NOT publish any reply, SHALL apply the standard failure policy (retry/dead-letter), and the sender SHALL observe `RpcTimeoutException` (never `RpcRemoteException`, which does not exist).
 
 **Validates: Requirements 2.10, 9.4**
+
+### Property 5c: RPC Exception-Retry Bounds and Scope
+
+*For any* RPC call with `MaxExceptionRetries = N`, when every attempt fails exceptionally (timeout, transport error, or response-deserialization failure), the sender SHALL make exactly `N + 1` publish attempts and then throw the last exception; and *for any* RPC call that returns a business failure (`TResponse` with `Error` set), the sender SHALL make exactly one attempt and return that response without retrying.
+
+**Validates: Requirements 2.11, 2.12**
 
 ### Property 6: Processor Fault Tolerance
 

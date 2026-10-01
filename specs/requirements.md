@@ -46,10 +46,13 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 4. An additional header identifies the message pattern as "rpc" (so the consumer knows which base interface to cast to)
 5. The RPC sender declares an exclusive reply queue named `{routingKey}.reply.{GUID}` (unique per sender instance)
 6. The consumer processes the request and publishes the serialized `TResponse` directly to the reply queue specified in the ReplyTo property (no wrapping envelope)
-7. Responses are correlated by correlation ID
+7. Requests and responses are matched by a unique per-message `MessageId` (regenerated for every message and every retry attempt). The `CorrelationId` is a process-level trace identifier that may be shared across multiple messages and across retries, and is used only for logging/tracing — never for request/response matching
 8. Timeout produces `RpcTimeoutException` (a client-side concern — the sender gave up waiting)
 9. Every RPC response type MUST extend the abstract `RpcResponse` base, which carries the operation outcome: an optional `RpcError` (`Code` + `Message`) and a derived `Success` (true when `Error` is null). The processor expresses business success or failure by setting `Error` on the response it returns — it does not throw for business outcomes
 10. Unexpected exceptions thrown by an RPC processor are NOT sent back to the sender. They follow the same failure path as standard messages (NACK, retry, dead-letter per Requirement 9). The sender observes only a timeout in this case
+11. The RPC sender supports bounded automatic retry on *exceptional* failures, configured via `MaxExceptionRetries` (default 0 = no retry) and `ExceptionRetryDelay` (default 1 second), settable on `RpcSenderOptions` and overridable per call via `RpcOptions`. An "exceptional failure" is a transport/infrastructure problem or a failure to obtain a usable response: a timeout (`RpcTimeoutException`), a broker/connection/publish error, or a failure to deserialize the response. On such a failure the sender waits `ExceptionRetryDelay` and resends, up to `MaxExceptionRetries` additional attempts; if all attempts are exhausted the last exception is thrown. The caller's `CancellationToken` is honored across attempts and during the delay
+12. A business failure (a `TResponse` returned with `Error` set / `Success` false) is NOT an exceptional failure and is NEVER retried — it is a normal return value handed straight back to the caller
+13. Because a retry resends the request, RPC exception-retry is only safe for **idempotent** operations: if the original request reached the consumer and was processed but its reply was lost or late, a retry causes the consumer to process the request again. Callers that cannot tolerate double-processing should leave `MaxExceptionRetries` at 0
 
 ### Requirement 3: Consumer and Processor Resolution
 

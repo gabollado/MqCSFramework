@@ -38,24 +38,39 @@ internal sealed class RpcRequestResponseHandler : IDisposable
         string routingKey,
         BasicProperties props,
         byte[] body,
+        string messageId,
         string correlationId,
         TimeSpan timeout,
         CancellationToken ct)
     {
         await EnsureStartedAsync(ct);
 
+        // Pending calls are keyed by the per-message MessageId, which is unique per message and per
+        // retry attempt. CorrelationId is NOT used for matching — it is a process-level trace id that
+        // can be shared across multiple messages, so two concurrent calls could collide under it.
         var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[correlationId] = tcs;
+        _pending[messageId] = tcs;
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(timeout);
 
         using var registration = cts.Token.Register(() =>
         {
-            if (_pending.TryRemove(correlationId, out var pendingTcs))
+            if (!_pending.TryRemove(messageId, out var pendingTcs))
             {
-                pendingTcs.TrySetException(new RpcTimeoutException(correlationId, timeout));
+                return;
             }
+
+            // The linked token fires on either the caller's cancellation or the timeout.
+            // Surface a cancellation as OperationCanceledException (not a retryable timeout) so
+            // callers and the sender's exception-retry logic can tell the two apart.
+            if (ct.IsCancellationRequested)
+            {
+                pendingTcs.TrySetCanceled(ct);
+                return;
+            }
+
+            pendingTcs.TrySetException(new RpcTimeoutException(correlationId, timeout));
         });
 
         try
@@ -67,7 +82,7 @@ internal sealed class RpcRequestResponseHandler : IDisposable
         }
         catch (Exception) when (!tcs.Task.IsCompleted)
         {
-            _pending.TryRemove(correlationId, out _);
+            _pending.TryRemove(messageId, out _);
             throw;
         }
     }
@@ -113,13 +128,16 @@ internal sealed class RpcRequestResponseHandler : IDisposable
 
     private Task HandleReplyAsync(object sender, BasicDeliverEventArgs ea)
     {
-        var correlationId = ea.BasicProperties?.CorrelationId;
-        if (correlationId is null)
+        // Match the reply to its pending request by MessageId (the per-message match key).
+        // An unmatched reply (e.g. a late reply to an attempt that already timed out and was removed)
+        // is silently discarded.
+        var messageId = ea.BasicProperties?.MessageId;
+        if (messageId is null)
         {
             return Task.CompletedTask;
         }
 
-        if (_pending.TryRemove(correlationId, out var tcs))
+        if (_pending.TryRemove(messageId, out var tcs))
         {
             tcs.TrySetResult(ea.Body.ToArray());
         }

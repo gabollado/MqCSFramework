@@ -188,6 +188,9 @@ internal sealed class MqConsumer : IAsyncDisposable
         {
             var replyProps = new BasicProperties
             {
+                // Echo the request's MessageId — the sender matches the reply to its pending call by this.
+                MessageId = ea.BasicProperties?.MessageId,
+                // Echo CorrelationId for trace continuity (not used for matching).
                 CorrelationId = ea.BasicProperties?.CorrelationId,
                 ContentType = "application/json"
             };
