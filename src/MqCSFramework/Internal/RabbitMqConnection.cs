@@ -96,10 +96,19 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
             UserName = _options.UserName,
             Password = _options.Password,
             VirtualHost = _options.VirtualHost,
-            AutomaticRecoveryEnabled = true,
-            TopologyRecoveryEnabled = true,
+            RequestedHeartbeat = _options.RequestedHeartbeat,
+            AutomaticRecoveryEnabled = _options.AutomaticRecoveryEnabled,
+            TopologyRecoveryEnabled = _options.TopologyRecoveryEnabled,
+            NetworkRecoveryInterval = _options.NetworkRecoveryInterval,
+            RequestedConnectionTimeout = _options.RequestedConnectionTimeout,
+            ContinuationTimeout = _options.ContinuationTimeout,
             ClientProvidedName = _options.ClientProvidedName
         };
+
+        if (_options.ConsumerDispatchConcurrency is { } concurrency)
+        {
+            factory.ConsumerDispatchConcurrency = concurrency;
+        }
 
         if (_options.UseSsl)
         {

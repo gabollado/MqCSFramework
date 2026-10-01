@@ -34,7 +34,7 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
         CancellationToken ct = default)
         where TProcessor : IRpcProcessor<TRequest, TResponse>
         where TRequest : class
-        where TResponse : class
+        where TResponse : RpcResponse
     {
         var messageId = Guid.NewGuid().ToString("N");
         var routingKey = options?.RoutingKey ?? _options.RoutingKey;
@@ -80,19 +80,9 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
         var responseBytes = await _replyConsumer.PublishAndAwaitReplyAsync(
             _options.Exchange, routingKey, props, body, correlationId, timeout, ct);
 
-        // Check for error response
-        var envelope = JsonSerializer.Deserialize<RpcResponseEnvelope>(responseBytes);
-        if (envelope is { IsError: true })
-        {
-            throw new RpcRemoteException(correlationId, envelope.ErrorMessage ?? "Unknown error", envelope.ErrorType);
-        }
-
-        if (envelope?.Payload is null)
-        {
-            throw new MessageSerializationException("RPC response payload was null.", messageId);
-        }
-
-        var response = JsonSerializer.Deserialize<TResponse>(envelope.Payload);
+        // The reply carries the serialized TResponse directly (no envelope).
+        // Business success/failure is read from TResponse.Success/Error by the caller.
+        var response = JsonSerializer.Deserialize<TResponse>(responseBytes);
         if (response is null)
         {
             throw new MessageSerializationException(

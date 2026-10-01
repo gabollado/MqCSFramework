@@ -9,7 +9,7 @@ namespace MqCSFramework;
 /// </summary>
 public abstract class RpcProcessor<TRequest, TResponse> : IRpcProcessor<TRequest, TResponse>
     where TRequest : class
-    where TResponse : class
+    where TResponse : RpcResponse
 {
     public async Task<byte[]> ProcessRawRpcAsync(ReadOnlyMemory<byte> body, MessageContext context, CancellationToken ct = default)
     {

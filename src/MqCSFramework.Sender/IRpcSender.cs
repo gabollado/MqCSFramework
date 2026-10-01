@@ -13,5 +13,5 @@ public interface IRpcSender
         CancellationToken ct = default)
         where TProcessor : IRpcProcessor<TRequest, TResponse>
         where TRequest : class
-        where TResponse : class;
+        where TResponse : RpcResponse;
 }

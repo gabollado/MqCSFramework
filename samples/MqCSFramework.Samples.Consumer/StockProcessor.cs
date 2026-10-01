@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
-using MqCSFramework;
 using MqCSFramework.Samples.Contracts;
 
 namespace MqCSFramework.Samples.Consumer;
@@ -14,6 +13,17 @@ public class StockProcessor(ILogger<StockProcessor> logger) : RpcProcessor<Stock
         logger.LogInformation("---- RPC Request Received ----");
         logger.LogInformation("SKU: {Sku}, Quantity requested: {Quantity}", request.Sku, request.Quantity);
 
+        // Business failure: return a response carrying an RpcError rather than throwing.
+        if (request.Quantity <= 0)
+        {
+            logger.LogWarning("Invalid quantity {Quantity} for SKU {Sku}. Returning business error.", request.Quantity, request.Sku);
+            var failure = new StockResponse
+            {
+                Error = new RpcError { Code = "INVALID_QUANTITY", Message = "Requested quantity must be greater than zero." }
+            };
+            return Task.FromResult(failure);
+        }
+
         var currentStock = _stock.GetOrAdd(request.Sku, _ => 50);
         var newStock = currentStock - request.Quantity;
         _stock[request.Sku] = newStock;
@@ -23,7 +33,12 @@ public class StockProcessor(ILogger<StockProcessor> logger) : RpcProcessor<Stock
         logger.LogInformation("SKU: {Sku}, Previous stock: {Previous}, New stock: {New}, Available: {Available}",
             request.Sku, currentStock, newStock, available);
 
-        var response = new StockResponse(Available: available, RemainingStock: newStock, UnitPrice: 19.99m);
+        var response = new StockResponse
+        {
+            Available = available,
+            RemainingStock = newStock,
+            UnitPrice = 19.99m
+        };
         return Task.FromResult(response);
     }
 }

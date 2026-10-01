@@ -1,6 +1,5 @@
 using MqCSFramework.Internal;
 using System.Text;
-using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
@@ -129,11 +128,10 @@ internal sealed class MqConsumer : IAsyncDisposable
             if (pattern == MqHeaders.PatternRpc)
             {
                 await DispatchRpcAsync(ea, processor, processorType, context);
+                return;
             }
-            else
-            {
-                await DispatchStandardAsync(ea, processor, processorType, context);
-            }
+
+            await DispatchStandardAsync(ea, processor, processorType, context);
         }
         catch (Exception ex)
         {
@@ -177,38 +175,24 @@ internal sealed class MqConsumer : IAsyncDisposable
             return;
         }
 
-        RpcResponseEnvelope envelope;
-        try
-        {
-            var responseBytes = await rpcProcessor.ProcessRawRpcAsync(ea.Body, context, CreateRpcTimeoutToken(ea));
-            envelope = new RpcResponseEnvelope { IsError = false, Payload = responseBytes };
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "RPC processor {ProcessorType} threw for message {MessageId}. Returning error response.",
-                processorType.FullName, context.MessageId);
+        // The processor produces the serialized TResponse bytes. Business failures are carried
+        // inside that response (RpcResponse.Error) — they are not exceptions. An unexpected
+        // exception is intentionally NOT caught here: it propagates to DispatchMessageCoreAsync,
+        // which routes it to HandleFailureAsync (NACK/retry/dead-letter). No reply is published
+        // in that case, so the sender times out.
+        var responseBytes = await rpcProcessor.ProcessRawRpcAsync(ea.Body, context, CreateRpcTimeoutToken(ea));
 
-            var innerEx = ex.InnerException ?? ex;
-            envelope = new RpcResponseEnvelope
-            {
-                IsError = true,
-                ErrorMessage = innerEx.Message,
-                ErrorType = innerEx.GetType().FullName
-            };
-        }
-
-        // Publish response to ReplyTo
+        // Publish the serialized TResponse directly to ReplyTo (no wrapping envelope).
         var replyTo = ea.BasicProperties?.ReplyTo;
         if (!string.IsNullOrEmpty(replyTo))
         {
-            var responseBody = JsonSerializer.SerializeToUtf8Bytes(envelope);
             var replyProps = new BasicProperties
             {
                 CorrelationId = ea.BasicProperties?.CorrelationId,
                 ContentType = "application/json"
             };
 
-            await _channel!.BasicPublishAsync("", replyTo, false, replyProps, responseBody);
+            await _channel!.BasicPublishAsync("", replyTo, false, replyProps, responseBytes);
         }
 
         await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
@@ -218,61 +202,61 @@ internal sealed class MqConsumer : IAsyncDisposable
     {
         var retryCount = MessageHelpers.GetRetryCount(ea);
 
-        if (_options.MaxRetries > 0 && retryCount >= _options.MaxRetries)
+        if (_options.MaxRetries <= 0 || retryCount < _options.MaxRetries)
         {
-            if (!string.IsNullOrEmpty(_options.DeadLetterExchange))
+            // Retry: republish with incremented retry header and ACK the original
+            var headers = ea.BasicProperties?.Headers != null
+                ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
+                : new Dictionary<string, object?>();
+            headers[MqHeaders.RetryCount] = retryCount + 1;
+
+            var retryProps = new BasicProperties
             {
-                _logger.LogWarning("Message {MessageId} exceeded max retries ({MaxRetries}). Routing to dead-letter.",
-                    messageId, _options.MaxRetries);
+                MessageId = ea.BasicProperties?.MessageId,
+                CorrelationId = ea.BasicProperties?.CorrelationId,
+                Timestamp = ea.BasicProperties?.Timestamp ?? new AmqpTimestamp(0),
+                ContentType = ea.BasicProperties?.ContentType,
+                ReplyTo = ea.BasicProperties?.ReplyTo,
+                Headers = headers
+            };
 
-                var dlProps = new BasicProperties
-                {
-                    MessageId = ea.BasicProperties?.MessageId,
-                    CorrelationId = ea.BasicProperties?.CorrelationId,
-                    ContentType = ea.BasicProperties?.ContentType,
-                    Headers = ea.BasicProperties?.Headers != null
-                        ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
-                        : new Dictionary<string, object?>()
-                };
+            await _channel!.BasicPublishAsync(
+                ea.Exchange ?? "",
+                ea.RoutingKey,
+                false, retryProps, ea.Body, CancellationToken.None);
 
-                await _channel!.BasicPublishAsync(
-                    _options.DeadLetterExchange,
-                    _options.DeadLetterRoutingKey ?? "",
-                    false, dlProps, ea.Body, CancellationToken.None);
+            await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
 
-                await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
-                return;
-            }
-
-            await NackWithoutRequeueAsync(ea);
+            _logger.LogWarning("Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued.",
+                messageId, retryCount + 1, _options.MaxRetries);
             return;
         }
 
-        // Retry: republish with incremented retry header and ACK the original
-        var headers = ea.BasicProperties?.Headers != null
-            ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
-            : new Dictionary<string, object?>();
-        headers[MqHeaders.RetryCount] = retryCount + 1;
-
-        var retryProps = new BasicProperties
+        if (!string.IsNullOrEmpty(_options.DeadLetterExchange))
         {
-            MessageId = ea.BasicProperties?.MessageId,
-            CorrelationId = ea.BasicProperties?.CorrelationId,
-            Timestamp = ea.BasicProperties?.Timestamp ?? new AmqpTimestamp(0),
-            ContentType = ea.BasicProperties?.ContentType,
-            ReplyTo = ea.BasicProperties?.ReplyTo,
-            Headers = headers
-        };
+            _logger.LogWarning("Message {MessageId} exceeded max retries ({MaxRetries}). Routing to dead-letter.",
+                messageId, _options.MaxRetries);
 
-        await _channel!.BasicPublishAsync(
-            ea.Exchange ?? "",
-            ea.RoutingKey,
-            false, retryProps, ea.Body, CancellationToken.None);
+            var dlProps = new BasicProperties
+            {
+                MessageId = ea.BasicProperties?.MessageId,
+                CorrelationId = ea.BasicProperties?.CorrelationId,
+                ContentType = ea.BasicProperties?.ContentType,
+                Headers = ea.BasicProperties?.Headers != null
+                    ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
+                    : new Dictionary<string, object?>()
+            };
 
-        await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+            await _channel!.BasicPublishAsync(
+                _options.DeadLetterExchange,
+                _options.DeadLetterRoutingKey ?? "",
+                false, dlProps, ea.Body, CancellationToken.None);
 
-        _logger.LogWarning("Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued.",
-            messageId, retryCount + 1, _options.MaxRetries);
+            await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+            return;
+        }
+
+        await NackWithoutRequeueAsync(ea);
     }
 
     private void LogMessageBody(BasicDeliverEventArgs ea, string messageId)

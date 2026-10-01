@@ -41,14 +41,15 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 #### Acceptance Criteria
 
 1. The RPC sender interface is `IRpcSender`
-2. The send method signature is `SendAsync<TProcessor, TResponse>(TRequest request, ...)` where `TProcessor : IRpcProcessor<TRequest, TResponse>` — request and response types are checked at compile time
+2. The send method signature is `SendAsync<TProcessor, TResponse>(TRequest request, ...)` where `TProcessor : IRpcProcessor<TRequest, TResponse>` and `TResponse : RpcResponse` — request and response types are checked at compile time
 3. The processor interface's AssemblyQualifiedName is set as the `mq-processor-type` message header
 4. An additional header identifies the message pattern as "rpc" (so the consumer knows which base interface to cast to)
 5. The RPC sender declares an exclusive reply queue named `{routingKey}.reply.{GUID}` (unique per sender instance)
-6. The consumer processes the request and publishes the response to the reply queue specified in the ReplyTo property
+6. The consumer processes the request and publishes the serialized `TResponse` directly to the reply queue specified in the ReplyTo property (no wrapping envelope)
 7. Responses are correlated by correlation ID
-7. Timeout produces `RpcTimeoutException`
-8. Consumer errors are propagated as `RpcRemoteException` to the sender
+8. Timeout produces `RpcTimeoutException` (a client-side concern — the sender gave up waiting)
+9. Every RPC response type MUST extend the abstract `RpcResponse` base, which carries the operation outcome: an optional `RpcError` (`Code` + `Message`) and a derived `Success` (true when `Error` is null). The processor expresses business success or failure by setting `Error` on the response it returns — it does not throw for business outcomes
+10. Unexpected exceptions thrown by an RPC processor are NOT sent back to the sender. They follow the same failure path as standard messages (NACK, retry, dead-letter per Requirement 9). The sender observes only a timeout in this case
 
 ### Requirement 3: Consumer and Processor Resolution
 
@@ -57,11 +58,11 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 #### Acceptance Criteria
 
 1. Processors inherit from abstract base classes: `StandardProcessor<TMessage>` (for standard) or `RpcProcessor<TRequest, TResponse>` (for RPC)
-2. Processor implementations are registered by the developer as standard DI singletons: `services.AddSingleton<IMyProcessor, MyProcessorImpl>()`
+2. Processor implementations are registered by the developer in DI, recommended as Scoped: `services.AddScoped<IMyProcessor, MyProcessorImpl>()`. Each message is processed within its own DI scope, so scoped processors (and their scoped dependencies like DbContext) get a fresh instance per message. Singleton or Transient registration is also supported depending on the use case.
 3. The generic interfaces extend non-generic base interfaces (`IMessageProcessor`, `IRpcProcessor`) with raw byte methods (`ProcessRawAsync`, `ProcessRawRpcAsync`) — the abstract base classes implement deserialization internally
 4. When a message arrives, the consumer reads the `mq-processor-type` header to get the processor interface name
 5. The consumer reads the `mq-pattern` header ("standard" or "rpc") to determine which non-generic interface to cast to
-6. The consumer resolves the processor singleton from DI using `Type.GetType(header)` + `serviceProvider.GetService(type)`
+6. The consumer creates a new DI scope per message and resolves the processor from that scope using `Type.GetType(header)` + `scope.ServiceProvider.GetService(type)`. This ensures scoped dependencies (e.g. DbContext) are isolated per message.
 7. For standard: casts to `IMessageProcessor` (non-generic) and calls `ProcessRawAsync(body, context, ct)`
 8. For RPC: casts to `IRpcProcessor` (non-generic) and calls `ProcessRawRpcAsync(body, context, ct)`
 9. Messages without the `mq-processor-type` header are rejected (NACK'd)
@@ -135,6 +136,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 1. Processor exceptions do not crash the consumer loop
 2. Failed messages are NACK'd
 3. Dead-letter support: messages exceeding a retry limit are routed to an error queue
+4. This path applies to both standard and RPC processors: an unexpected exception from an RPC processor is NACK'd/retried/dead-lettered exactly like a standard message. No error response is published to the reply queue — business failures must instead be returned as an `RpcError` on the response (see Requirement 2)
 
 ## Non-Functional Requirements
 
@@ -149,7 +151,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 | # | Decision |
 |---|----------|
 | 1 | RabbitMQ only — no transport abstraction layer for now |
-| 2 | Processors registered as standard DI singletons |
+| 2 | Processors recommended as Scoped DI registrations (one instance per message scope). Singleton and Transient also supported. |
 | 3 | Sender always specifies processor contract interface (no fallback routing) |
 | 4 | Each sender/consumer has its own independent connection |
 | 5 | Three packages: `MqCSFramework` (core/shared), `MqCSFramework.Sender`, `MqCSFramework.Consumer` |
