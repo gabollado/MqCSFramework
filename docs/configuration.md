@@ -85,6 +85,7 @@ Embedded in each sender/consumer. Every endpoint has its own independent connect
 | `UseSsl` | bool | `false` | Enable SSL/TLS for every host |
 | `SslServerName` | string? | `null` | Certificate name checked for every host. When empty, each host is checked against its own name |
 | `ClientProvidedName` | string? | `null` | Connection name visible in RabbitMQ management UI |
+| `RequestedConnectionTimeout` | TimeSpan | `00:00:30` | Budget per host for opening a connection (TCP, TLS, AMQP handshake). The whole connect fails with `TimeoutException` after this times the number of hosts |
 
 There is no separate `Port` setting: put a non-default port in `HostName` (`"rabbit.example.com:5673"`).
 
@@ -121,6 +122,7 @@ Configuration for a fire-and-forget sender.
 | `Connection` | RabbitMqConnectionOptions | (see above) | Connection settings for this sender |
 | `Exchange` | string | `""` | Exchange to publish to (empty = default exchange) |
 | `RoutingKey` | string | `""` | Default routing key (queue name for default exchange) |
+| `TimeoutMs` | int | `20000` | Upper bound for one send (connect if needed + publish), together with the caller's token. On expiry `SendAsync` throws `TimeoutException`. `0` disables it |
 
 ### Example
 

@@ -276,6 +276,9 @@ Properties:
   - SslServerName: string or null (default null) - certificate name checked for every host;
       when null or empty, each host is checked against its own name
   - ClientProvidedName: string or null (default null)
+  - RequestedConnectionTimeout: duration (default 30 seconds) - budget per host for opening a
+      connection (TCP connect, TLS, AMQP handshake); the whole connect is capped at this value
+      times the number of hosts
 ```
 
 #### Exceptions
@@ -375,6 +378,11 @@ Internal behavior (CreateConnection):
     against its own name).
   Calls the factory's async create connection method with the endpoint list. The client tries the
   endpoints in random order, for the initial connection and again on automatic recovery.
+  Caps that call at options.RequestedConnectionTimeout x number of endpoints, using a token linked
+  to the caller's. The client applies RequestedConnectionTimeout to the TCP connect only and can wait
+  forever when a server accepts TCP but never answers the AMQP handshake (e.g. plaintext to a TLS port).
+  When the cap (not the caller) cancels the connect, throws TimeoutException naming the endpoints;
+  a caller's cancellation propagates unchanged.
 
 DisposeAsync behavior:
   Closes channel and connection gracefully, disposes the semaphore.
@@ -432,6 +440,8 @@ Properties:
   - Connection: RabbitMqConnectionOptions (default new instance)
   - Exchange: string (default "")
   - RoutingKey: string (default "")
+  - TimeoutMs: integer milliseconds (default 20000) - upper bound for one send (connecting if needed,
+    then publishing), applied together with the caller's cancellation token. 0 or less disables it.
 ```
 
 **Class: RpcSenderOptions** (final/non-inheritable)
@@ -559,11 +569,14 @@ SendAsync behavior:
        - "mq-processor-type" = TProcessor's assembly-qualified type name
        - "mq-pattern" = "standard"
   5. Merge any AdditionalHeaders from options into the headers
-  6. Get channel from connection, publish message asynchronously
+  6. Link the caller's cancellation token with options.TimeoutMs (when > 0); get channel from
+     connection and publish message asynchronously, both with the linked token
   7. On publish failure (any exception except MessageSerializationException):
      - Log error with messageId, exchange, routingKey
      - Call connection.ResetChannelAsync()
-     - Re-throw the exception
+     - If the failure is a cancellation caused by TimeoutMs (not by the caller's token):
+       throw TimeoutException wrapping it
+     - Otherwise re-throw the exception
   8. Log info: published standard message with messageId, processor name, exchange, routingKey
   9. Return messageId
 ```
@@ -1258,7 +1271,8 @@ rpcSender = services.GetRequiredKeyedService<IRpcSender>("stock")
           "ClientProvidedName": "sender-orders"
         },
         "Exchange": "",
-        "RoutingKey": "orders-queue"
+        "RoutingKey": "orders-queue",
+        "TimeoutMs": 20000
       }
     },
     "RpcSenders": {
@@ -1322,6 +1336,8 @@ The `correlationId` is a **mandatory parameter** on both `IStandardSender.SendAs
 
 - **Standard messages**: Consumer creates a cancellation token from `ConsumerOptions.ProcessingTimeoutMs` (milliseconds). If `<= 0`, no timeout (no-cancellation token).
 - **RPC messages**: The sender stamps `mq-cancellation-deadline` header with `(currentUtcTime + timeout).Ticks` as a string. The consumer reads this header and creates a cancellation token with the remaining time until the deadline. If the deadline has already passed, returns an already-canceled token. If the header is missing or unparseable, returns a no-cancellation token.
+- **Standard sends**: `StandardSenderOptions.TimeoutMs` (default 20000) is linked with the caller's token for the whole `SendAsync` (connect if needed + publish). Its expiry surfaces as `TimeoutException`; the caller's own cancellation surfaces as a cancellation.
+- **Opening a connection**: capped at `RequestedConnectionTimeout` x number of hosts for every sender and consumer; its expiry surfaces as `TimeoutException`.
 
 ### Connection Recovery
 
@@ -1336,7 +1352,7 @@ The RabbitMQ client library handles reconnection internally. The framework relie
 When the standard sender encounters a publish failure (exception other than `MessageSerializationException`):
 1. Logs the error
 2. Calls `connection.ResetChannelAsync()` to close and null the channel
-3. Re-throws the exception
+3. Re-throws the exception (a cancellation caused by the send timeout is thrown as `TimeoutException`)
 4. Next send attempt will create a fresh channel via `GetChannelAsync`
 
 ### RPC Error Handling

@@ -33,6 +33,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 4. An additional header identifies the message pattern as "standard" (so the consumer knows which base interface to cast to)
 5. Messages include metadata: message ID (GUID), timestamp, correlation ID
 6. The message is serialized and published to the configured exchange/routing key
+7. Each send is bounded by the sender's timeout (`TimeoutMs`, default 20 seconds; 0 or less disables it), applied together with the caller's cancellation token. When the timeout expires the send fails with a timeout error; a caller's cancellation still surfaces as a cancellation
 
 ### Requirement 2: RPC Messaging (Request-Reply)
 
@@ -83,6 +84,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 4. Connections auto-reconnect on failure
 5. The host setting accepts one or more comma-separated `host` or `host:port` entries (the nodes of one cluster). An entry without a port uses the AMQP default (5672, or 5671 with TLS). The client tries the entries in random order for the initial connection and again when it auto-reconnects
 6. TLS, when enabled, applies to every host. The certificate name checked is a configurable server name, or each host's own name when none is set
+7. Opening a connection is bounded: the whole connect (TCP, TLS and AMQP handshake) is capped at the connection timeout per listed host and then fails with a timeout error, because the RabbitMQ client alone can wait forever when a server accepts TCP but never answers the handshake. A caller's cancellation still surfaces as a cancellation
 
 ### Requirement 5: DI Integration
 

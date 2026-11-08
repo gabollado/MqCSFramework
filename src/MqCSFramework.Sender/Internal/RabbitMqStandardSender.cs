@@ -65,16 +65,25 @@ internal sealed class RabbitMqStandardSender : IStandardSender
             }
         }
 
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        if (_options.TimeoutMs > 0)
+            timeoutCts.CancelAfter(_options.TimeoutMs);
+
         try
         {
-            var channel = await _connection.GetChannelAsync(ct);
-            await channel.BasicPublishAsync(_options.Exchange, routingKey, false, props, body, ct);
+            var channel = await _connection.GetChannelAsync(timeoutCts.Token);
+            await channel.BasicPublishAsync(_options.Exchange, routingKey, false, props, body, timeoutCts.Token);
         }
         catch (Exception ex) when (ex is not MessageSerializationException)
         {
             _logger.LogError(ex, "Failed to publish standard message {MessageId} to {Exchange}/{RoutingKey}",
                 messageId, _options.Exchange, routingKey);
             await _connection.ResetChannelAsync();
+
+            // Our own send timeout, not the caller's cancellation: report it as a timeout.
+            if (ex is OperationCanceledException && timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+                throw new TimeoutException($"Sending standard message {messageId} timed out after {_options.TimeoutMs}ms.", ex);
+
             throw;
         }
 

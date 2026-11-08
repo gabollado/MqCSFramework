@@ -56,7 +56,9 @@ public sealed class RabbitMqConnectionOptions
     public TimeSpan NetworkRecoveryInterval { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Timeout for establishing the initial TCP/AMQP connection.
+    /// Budget per host for opening a connection: TCP connect, TLS and the AMQP handshake. The whole
+    /// connect is capped at this value times the number of hosts in <see cref="HostName"/> and then
+    /// fails with <see cref="TimeoutException"/>.
     /// </summary>
     public TimeSpan RequestedConnectionTimeout { get; set; } = TimeSpan.FromSeconds(30);
 

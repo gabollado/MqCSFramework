@@ -124,11 +124,25 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
             };
         }
 
+        var endpointList = string.Join(", ", endpoints.Select(e => $"{e.HostName}:{e.Port}"));
         _logger.LogInformation("Connecting to RabbitMQ at {Endpoints}, vhost {VHost}, as {ClientName}",
-            string.Join(", ", endpoints.Select(e => $"{e.HostName}:{e.Port}")), _options.VirtualHost, _options.ClientProvidedName ?? "unnamed");
+            endpointList, _options.VirtualHost, _options.ClientProvidedName ?? "unnamed");
 
-        var connection = await factory.CreateConnectionAsync(endpoints, ct);
-        return connection;
+        // RabbitMQ.Client applies RequestedConnectionTimeout to the TCP connect only: when a server accepts
+        // TCP but never answers the AMQP handshake (e.g. plaintext to a TLS port), CreateConnectionAsync can
+        // wait forever. Cap the whole connect per endpoint, since endpoints are tried one after another.
+        var timeout = _options.RequestedConnectionTimeout * endpoints.Length;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
+
+        try
+        {
+            return await factory.CreateConnectionAsync(endpoints, timeoutCts.Token);
+        }
+        catch (OperationCanceledException ex) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Timed out after {timeout.TotalSeconds:0}s connecting to RabbitMQ at {endpointList}.", ex);
+        }
     }
 
     public async ValueTask DisposeAsync()

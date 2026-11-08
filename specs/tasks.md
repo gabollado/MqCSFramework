@@ -37,8 +37,8 @@ The implementation language is C# 14 / .NET 10.
     - _Requirements: 1.1, 1.2, 2.1, 2.2_
 
   - [ ] 2.3 Create configuration options classes
-    - Create `RabbitMqConnectionOptions` (HostName [comma-separated `host` or `host:port`, no separate port property], UserName, Password, VirtualHost, UseSsl, SslServerName, ClientProvidedName)
-    - Create `StandardSenderOptions` (Connection, Exchange, RoutingKey)
+    - Create `RabbitMqConnectionOptions` (HostName [comma-separated `host` or `host:port`, no separate port property], UserName, Password, VirtualHost, UseSsl, SslServerName, ClientProvidedName, RequestedConnectionTimeout [default 30s, connect budget per host])
+    - Create `StandardSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 20000, <= 0 disables])
     - Create `RpcSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 30000], MaxExceptionRetries [default 0], ExceptionRetryDelayMs [int ms, default 1000])
     - Create `ConsumerOptions` (Connection, QueueName, PrefetchCount, MaxRetries, DeadLetterExchange, DeadLetterRoutingKey, SuppressMessageBodyLogging, MaskedFields)
     - Create `SendOptions` (RoutingKey, CorrelationId, AdditionalHeaders)
@@ -57,8 +57,9 @@ The implementation language is C# 14 / .NET 10.
     - Use `ConnectionFactory` with `AutomaticRecoveryEnabled = true`
     - Map the `RabbitMqConnectionOptions` credentials, virtual host and client name to the factory
     - Parse `HostName` with `AmqpTcpEndpoint.ParseMultiple`, give each endpoint its own SSL option (enabled = `UseSsl`, server name = `SslServerName` when set, otherwise the endpoint's host), and connect with the endpoint list
+    - Cap the connect at `RequestedConnectionTimeout` x number of endpoints with a token linked to the caller's; when the cap (not the caller) cancels it, throw `TimeoutException`
     - Implement `IAsyncDisposable` for graceful channel and connection close
-    - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6_
+    - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6, 4.7_
 
 - [ ] 4. Implement standard sender
   - [ ] 4.1 Create RabbitMqStandardSender internal class implementing IStandardSender
@@ -67,9 +68,10 @@ The implementation language is C# 14 / .NET 10.
     - Build `BasicProperties` with MessageId (GUID), CorrelationId, Timestamp, ContentType, and headers (`mq-processor-type` = AssemblyQualifiedName of TProcessor, `mq-pattern` = "standard")
     - Merge `SendOptions.AdditionalHeaders` if provided
     - Publish via `channel.BasicPublishAsync` to configured exchange/routing key
+    - Bound getting the channel and publishing with `TimeoutMs` through a token linked to the caller's; on that timeout reset the channel and throw `TimeoutException`
     - Return the generated MessageId
     - Log the send operation with correlation ID
-    - _Requirements: 1.3, 1.4, 1.5, 1.6, 7.1, 8.1, 8.2_
+    - _Requirements: 1.3, 1.4, 1.5, 1.6, 1.7, 7.1, 8.1, 8.2_
 
   - [ ]* 4.2 Write property test for message envelope correctness (standard sender)
     - **Property 1: Message Envelope Correctness**

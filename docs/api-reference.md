@@ -82,6 +82,9 @@ public interface IStandardSender
 
 **Returns:** The generated message ID (GUID string).
 
+**Throws:**
+- `TimeoutException` — the send (connect if needed + publish) didn't finish within `StandardSenderOptions.TimeoutMs`, or the connection couldn't be opened within `RequestedConnectionTimeout` per host
+
 **Generic constraints** enforce compile-time safety — you cannot send a message type that doesn't match the processor's expectation.
 
 ---
@@ -105,6 +108,7 @@ public interface IRpcSender
 
 **Throws:**
 - `RpcTimeoutException` — if no response within the configured timeout
+- `TimeoutException` — if the connection couldn't be opened within `RequestedConnectionTimeout` per host
 - `RpcRemoteException` — if the processor threw an exception
 
 ---
