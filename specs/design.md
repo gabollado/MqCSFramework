@@ -138,7 +138,7 @@ Consumer side:
 2. Consumer resolves the type by name → resolves from DI via the service provider
 3. Casts to `IMessageProcessor` (non-generic) → calls `ProcessRawAsync(body, context, cancellationToken)`
 4. Cancellation token created from `ConsumerOptions.ProcessingTimeoutMs`
-5. On success: ACK. On failure: retry logic (increment `mq-retry-count`, dead-letter if exceeded)
+5. On success: ACK. On failure: retry logic (framework mode: increment `mq-retry-count`, republish to the consumer's own queue, dead-letter if exceeded; `BrokerRetry` mode: reject with requeue and let the broker apply the policy)
 
 ### Message Flow — RPC Pattern
 
@@ -844,11 +844,14 @@ Properties:
   - Connection: RabbitMqConnectionOptions (default new instance)
   - QueueName: string (default "")
   - PrefetchCount: unsigned short integer (default 10)
-  - MaxRetries: integer (default 3)
+  - MaxRetries: integer (default 3). Framework retries per message; 0 or less = no retry
   - ProcessingTimeoutMs: integer (default 30000)
   - DeadLetterExchange: string or null (default null)
   - DeadLetterRoutingKey: string or null (default null)
   - MaskedFields: read-only list of strings (default empty list)
+  - BrokerRetry: boolean (default false). When true the queue is declared as a quorum queue and failed
+    messages are rejected with requeue; delay, retry limit and dead-lettering come from a RabbitMQ policy
+    (RabbitMQ 4.3+). MaxRetries, DeadLetterExchange and DeadLetterRoutingKey are not used in this mode
 ```
 
 Note: `ConsumerOptions` does NOT have a `SuppressMessageBodyLogging` property. Body logging is at debug level and is controlled via per-namespace log level overrides in configuration.
@@ -1022,7 +1025,8 @@ Parameters:
 Behavior:
   1. Create a new RabbitMqConnection with options.Connection and the logger
   2. Get a channel from the connection
-  3. Declare queue (idempotent): name=options.QueueName, durable=true, exclusive=false, autoDelete=false, no arguments
+  3. Declare queue (idempotent): name=options.QueueName, durable=true, exclusive=false, autoDelete=false,
+     arguments = { "x-queue-type": "quorum" } when options.BrokerRetry, otherwise none
   4. Set prefetch: prefetchSize=0, prefetchCount=options.PrefetchCount, global=false
   5. Create an async event consumer, attach DispatchMessageAsync to its received event
   6. Start consuming: queue=options.QueueName, autoAck=false
@@ -1126,12 +1130,19 @@ Parameters:
   - deliveryEventArgs: the received message event
   - messageId: string
 Behavior:
+  0. If options.BrokerRetry:
+     - Reject the message with requeue = true (basic.reject increments the quorum delivery count;
+       the broker's policy applies delayed-retry, delivery-limit and dead-letter-exchange)
+     - Log warning: "Message {MessageId} failed. Rejected for broker retry."
+     - Return
   1. Read current retry count from headers via MessageHelpers.GetRetryCount (0 if not present)
-  2. If retries NOT exhausted (MaxRetries <= 0 OR retryCount < MaxRetries):
+  2. If retries NOT exhausted (retryCount < MaxRetries; MaxRetries <= 0 means no retry):
      - Copy all headers from original (or create empty dictionary if none)
      - Set "mq-retry-count" = retryCount + 1
      - Create new properties copying: MessageId, CorrelationId, Timestamp, ContentType, Persistent, ReplyTo, Headers
-     - Republish to the same exchange/routing key as the original
+     - Republish to the consumer's own queue: exchange "" (default exchange), routing key options.QueueName.
+       Not the original exchange/routing key, so a fanout/topic exchange does not deliver the copy to
+       other bound queues again
      - ACK the original message
      - Log warning: "Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued."
      - Return
@@ -1293,8 +1304,10 @@ On business failure (processor set `Error` on the response):
 
 Retry count is tracked via a custom header `mq-retry-count` (integer). On each failure, the consumer:
 1. Reads the current retry count from the header (0 if not present)
-2. If `retryCount >= MaxRetries`: publishes to dead-letter exchange (if configured) and ACKs, otherwise NACKs without requeue
-3. If under limit: republishes the message to the same exchange/routing key with `mq-retry-count` incremented by 1, preserving all other properties (MessageId, CorrelationId, Timestamp, ContentType, Persistent, ReplyTo, Headers), then ACKs the original. The dead-letter copy also keeps the original's Persistent flag
+2. If `retryCount >= MaxRetries` (always true when `MaxRetries <= 0`): publishes to dead-letter exchange (if configured) and ACKs, otherwise NACKs without requeue
+3. If under limit: republishes the message to its own queue (default exchange `""`, routing key `QueueName`) with `mq-retry-count` incremented by 1, preserving all other properties (MessageId, CorrelationId, Timestamp, ContentType, Persistent, ReplyTo, Headers), then ACKs the original. The dead-letter copy also keeps the original's Persistent flag
+
+With `BrokerRetry = true` none of the above applies: the consumer rejects the message with requeue and the broker tracks the attempts in the quorum queue's delivery count (`x-delivery-count`). Delay (`delayed-retry-type/min/max`), limit (`delivery-limit`, default 20) and dead-lettering (`dead-letter-exchange`) are set by a RabbitMQ policy, not by the framework.
 
 ### Queue Declaration
 
@@ -1302,9 +1315,9 @@ The consumer declares its queue on startup with these settings:
 - durable: true
 - exclusive: false
 - autoDelete: false
-- arguments: none
+- arguments: none, or `x-queue-type: quorum` when `BrokerRetry = true`
 
-This is idempotent — creates if not exists, no-op if already exists.
+This is idempotent — creates if not exists, no-op if already exists. The queue type can only be set at declaration: declaring an existing classic queue as quorum (or the reverse) fails with 406 PRECONDITION_FAILED, so switching `BrokerRetry` on an existing queue requires recreating it.
 
 ## DI Registration and Usage Patterns
 
@@ -1564,9 +1577,9 @@ Two distinct cases:
 
 ### Property 7: Dead-Letter Routing on Retry Exhaustion
 
-*For any* message with a retry count greater than or equal to `MaxRetries`, if a `DeadLetterExchange` is configured, the consumer SHALL publish the message to that exchange rather than requeuing it. If no dead-letter exchange is configured, the message is NACK'd without requeue.
+*For any* message with a retry count greater than or equal to `MaxRetries`, if a `DeadLetterExchange` is configured, the consumer SHALL publish the message to that exchange rather than requeuing it. If no dead-letter exchange is configured, the message is NACK'd without requeue. With `MaxRetries <= 0` this holds on the first failure. A retry copy under the limit is published to the default exchange with routing key `QueueName`. With `BrokerRetry = true` the consumer instead rejects with requeue and never republishes.
 
-**Validates: Requirements 9.3**
+**Validates: Requirements 9.3, 9.7, 9.8**
 
 ### Property 8: Sensitive Field Masking
 

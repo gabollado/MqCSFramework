@@ -236,11 +236,95 @@ If a consumer can't start (for example its broker is down, or the connect times 
 | `Connection` | RabbitMqConnectionOptions | (see above) | Connection settings for this consumer |
 | `QueueName` | string | `""` | Queue to consume from (declared automatically on startup) |
 | `PrefetchCount` | ushort | `10` | Number of unacknowledged messages allowed (controls parallelism) |
-| `MaxRetries` | int | `3` | Maximum retry attempts before dead-lettering (0 = NACK without requeue on first failure) |
+| `MaxRetries` | int | `3` | Maximum retry attempts before dead-lettering. `0` = no retry: the first failure goes to the dead-letter exchange, or is NACKed without requeue if none is set. A retry copy is republished to this consumer's own queue (`QueueName`) |
 | `DeadLetterExchange` | string? | `null` | Exchange to publish failed messages to after retry exhaustion |
 | `DeadLetterRoutingKey` | string? | `null` | Routing key for dead-letter messages |
 | `SuppressMessageBodyLogging` | bool | `false` | When true, message bodies are not included in log output |
 | `MaskedFields` | string[] | `[]` | JSON field names whose values are replaced with `***MASKED***` in logs |
+| `BrokerRetry` | bool | `false` | Let RabbitMQ handle retries: the queue is declared as a quorum queue and failed messages are rejected with requeue. `MaxRetries`, `DeadLetterExchange` and `DeadLetterRoutingKey` are ignored. See [Broker retry](#broker-retry-quorum-queues) |
+
+### Broker retry (quorum queues)
+
+With `"BrokerRetry": true` the framework doesn't count retries. It declares the queue with `x-queue-type: quorum`, and on failure rejects the message with requeue. RabbitMQ then counts the deliveries and applies the delay, the limit and the dead-lettering from a policy.
+
+Requirements and caveats:
+
+- **RabbitMQ 4.3 or later.** Delayed retry exists only on quorum queues from 4.3.
+- **The queue type can't change.** If the queue already exists as a classic queue, the consumer fails to start with `406 PRECONDITION_FAILED`. Delete and recreate the queue (or switch to a new queue name) when you turn this on.
+- **Set a policy.** Without one, a failed message is redelivered immediately until it has failed more than 20 times (RabbitMQ's default delivery limit), and then it is dropped.
+- **Set a dead-letter exchange in the policy** if you don't want messages over the limit dropped. If that exchange doesn't exist, RabbitMQ drops them silently.
+
+#### RabbitMQ setup
+
+The example below uses the consumer queue `orders-queue` on vhost `/`. It retries after 1s, 2s, 3s… capped at 30s. After more than 10 failures the message goes to the queue `orders-queue.dead`.
+
+**1. Check the version.** The management UI shows it at the top of every page, or run `rabbitmqctl version`. It must be 4.3 or later.
+
+**2. Remove the old queue if it is classic.** Skip this for a new queue. In the management UI, open *Queues and Streams*: the *Type* column must say `quorum`. If it says `classic`, stop the consumers, move or drain any messages you need, then delete the queue (queue page → *Delete*). The consumer recreates it as quorum on startup.
+
+**3. Create the dead-letter exchange and queue.** A `fanout` exchange sends every dead-lettered message to its queue whatever its routing key is.
+
+Management UI:
+
+- *Exchanges* → *Add a new exchange*: name `orders-dlx`, type `fanout`, durability `Durable`.
+- *Queues and Streams* → *Add a new queue*: type `Quorum`, name `orders-queue.dead`.
+- Open exchange `orders-dlx` → *Bindings* → *Add binding from this exchange*: to queue `orders-queue.dead`, routing key empty.
+
+HTTP API (`%2F` is the vhost `/`):
+
+```bash
+curl -u admin:password -X PUT -H "content-type: application/json" \
+  -d '{"type": "fanout", "durable": true}' \
+  https://rabbit.example.com/api/exchanges/%2F/orders-dlx
+
+curl -u admin:password -X PUT -H "content-type: application/json" \
+  -d '{"durable": true, "arguments": {"x-queue-type": "quorum"}}' \
+  https://rabbit.example.com/api/queues/%2F/orders-queue.dead
+
+curl -u admin:password -X POST -H "content-type: application/json" \
+  -d '{"routing_key": ""}' \
+  https://rabbit.example.com/api/bindings/%2F/e/orders-dlx/q/orders-queue.dead
+```
+
+**4. Create the retry policy.** Use a name pattern that matches only the consumer queues. Here `^orders-queue$` doesn't match the dead-letter queue `orders-queue.dead`, so failed messages there are not retried.
+
+| Key | Value | Meaning |
+|-----|-------|---------|
+| `delayed-retry-type` | `failed` | Delay messages whose delivery count went up. That covers the framework's reject, and also a consumer whose connection drops before it ACKs |
+| `delayed-retry-min` | `1000` | Delay in ms after the first failure. The delay is `min × delivery count` |
+| `delayed-retry-max` | `30000` | Maximum delay in ms |
+| `delivery-limit` | `10` | Once a message has failed more times than this, it is dead-lettered (or dropped). Default 20 |
+| `dead-letter-exchange` | `orders-dlx` | Where messages over the limit go |
+
+rabbitmqctl (bash):
+
+```bash
+rabbitmqctl set_policy --vhost "/" orders-retry "^orders-queue$" \
+  '{"delayed-retry-type": "failed", "delayed-retry-min": 1000, "delayed-retry-max": 30000, "delivery-limit": 10, "dead-letter-exchange": "orders-dlx"}' \
+  --priority 10 --apply-to quorum_queues
+```
+
+Management UI: *Admin* → *Policies* → *Add / update a policy*. Enter name `orders-retry`, pattern `^orders-queue$`, *Apply to* `Queues [Quorum]`, priority `10`. Add each key from the table to *Definition*, setting the numeric values to type *Number*.
+
+HTTP API:
+
+```bash
+curl -u admin:password -X PUT -H "content-type: application/json" \
+  -d '{"pattern": "^orders-queue$", "apply-to": "quorum_queues", "priority": 10, "definition": {"delayed-retry-type": "failed", "delayed-retry-min": 1000, "delayed-retry-max": 30000, "delivery-limit": 10, "dead-letter-exchange": "orders-dlx"}}' \
+  https://rabbit.example.com/api/policies/%2F/orders-retry
+```
+
+Policies apply right away to queues that already exist and to queues created later, so you can create the policy before or after the consumer first starts.
+
+**5. Check it.** Start the consumer, then open the queue `orders-queue` in the management UI. *Type* should be `quorum`, *Policy* should be `orders-retry`, and *Effective policy definition* should list the keys above. If *Policy* shows a different policy, another policy matches the name with a higher priority. Only one policy applies to a queue, so raise the priority of yours (see the Amazon MQ note below).
+
+Watch out for:
+
+- **One policy per queue.** If a queue also needs other policy keys (`max-length`, `overflow`, …), put them in the same policy.
+- **Amazon MQ.** You can't use `rabbitmqctl`. Use the RabbitMQ web console (Amazon MQ console → broker → *RabbitMQ web console URL*) or the HTTP API with an administrator user. On cluster brokers, Amazon's default `AWS-DEFAULT-QUORUM-QUEUES-POLICY-CLUSTER-MULTI-AZ` applies to quorum queues with priority 1. Give your policy a priority above 1 and copy that policy's definition keys into yours, otherwise your queue loses them. Delayed retry needs Amazon MQ for RabbitMQ 4.3, which is currently only on m7g instances.
+- **Dead-lettering can lose messages by default.** A quorum queue dead-letters at-most-once by default, so a message can be lost if the dead-letter queue is unavailable when it is moved. For at-least-once, add `"dead-letter-strategy": "at-least-once"` and `"overflow": "reject-publish"` to the policy. RabbitMQ also recommends `max-length` with it. See [quorum queue dead-lettering](https://www.rabbitmq.com/docs/quorum-queues#dead-lettering).
+
+References: [quorum queues: delayed retry and poison message handling](https://www.rabbitmq.com/docs/quorum-queues), [policies](https://www.rabbitmq.com/docs/policies), [dead-letter exchanges](https://www.rabbitmq.com/docs/dlx), [Amazon MQ broker defaults](https://docs.aws.amazon.com/amazon-mq/latest/developer-guide/rabbitmq-defaults.html).
 
 ### Example
 

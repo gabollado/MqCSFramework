@@ -40,7 +40,7 @@ The implementation language is C# 14 / .NET 10.
     - Create `RabbitMqConnectionOptions` (HostName [comma-separated `host` or `host:port`, no separate port property], UserName, Password, VirtualHost, UseSsl, SslServerName, ClientProvidedName, RequestedConnectionTimeout [default 30s, connect budget per host], ConfirmPublish [default false, publisher confirms + mandatory for every publish on the connection])
     - Create `StandardSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 20000, <= 0 disables])
     - Create `RpcSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 30000], MaxExceptionRetries [default 0], ExceptionRetryDelayMs [int ms, default 1000])
-    - Create `ConsumerOptions` (Connection, QueueName, PrefetchCount, MaxRetries, DeadLetterExchange, DeadLetterRoutingKey, SuppressMessageBodyLogging, MaskedFields)
+    - Create `ConsumerOptions` (Connection, QueueName, PrefetchCount, MaxRetries, DeadLetterExchange, DeadLetterRoutingKey, SuppressMessageBodyLogging, MaskedFields, BrokerRetry [default false, quorum queue + reject requeue])
     - Create `SendOptions` (RoutingKey, CorrelationId, AdditionalHeaders)
     - Create `RpcOptions` (RoutingKey, TimeoutMs [nullable int ms override], MaxExceptionRetries [nullable override], ExceptionRetryDelayMs [nullable int ms override], AdditionalHeaders)
     - _Requirements: 4.1, 5.2, 5.3, 5.4, 8.3, 8.4, 9.3_
@@ -126,10 +126,11 @@ The implementation language is C# 14 / .NET 10.
     - For standard pattern: ACK on success, handle failures per retry logic
     - For RPC pattern: call ProcessAsync to get serialized `TResponse` bytes, publish them directly to the ReplyTo queue echoing the request's `MessageId` (the sender's match key) and `CorrelationId` on the reply, then ACK. Do NOT catch processor exceptions here — let them propagate to the shared failure path (retry/dead-letter); no reply is sent on an unexpected exception
     - Handle missing headers (NACK without requeue), unresolvable types (NACK without requeue), deserialization failures (NACK without requeue)
-    - Track retry count via `mq-retry-count` header; dead-letter when count >= MaxRetries. Retry and dead-letter copies keep the original's `Persistent` flag; RPC replies stay transient
+    - Track retry count via `mq-retry-count` header; dead-letter when count >= MaxRetries (`MaxRetries <= 0` = no retry). Republish retry copies to the consumer's own queue (default exchange `""`, routing key `QueueName`), not the original exchange/routing key. Retry and dead-letter copies keep the original's `Persistent` flag; RPC replies stay transient
+    - When `BrokerRetry` is true: declare the queue with `x-queue-type: quorum` and, on failure, `BasicRejectAsync(requeue: true)` instead of the framework retry/dead-letter path (delay, limit and DLX come from a RabbitMQ policy)
     - Publish RPC replies, retry republishes and dead-letter publishes with `mandatory = connection.ConfirmPublish`; a `PublishException` on the RPC reply is logged as a warning and the request is still ACKed; on a republish it falls through to the NACK-without-requeue fallback
     - Implement `IAsyncDisposable` for graceful channel/connection close
-    - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3, 9.5, 9.6_
+    - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3, 9.5, 9.6, 9.7, 9.8_
 
   - [ ]* 7.3 Write property test for consumer dispatch correctness
     - **Property 3: Consumer Dispatch Correctness**

@@ -43,7 +43,7 @@ internal sealed class MqConsumer : IAsyncDisposable
             durable: true,
             exclusive: false,
             autoDelete: false,
-            arguments: null,
+            arguments: _options.BrokerRetry ? new Dictionary<string, object?> { ["x-queue-type"] = "quorum" } : null,
             cancellationToken: ct);
 
         await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: _options.PrefetchCount, global: false, cancellationToken: ct);
@@ -215,9 +215,18 @@ internal sealed class MqConsumer : IAsyncDisposable
 
     private async Task HandleFailureAsync(BasicDeliverEventArgs ea, string messageId)
     {
+        if (_options.BrokerRetry)
+        {
+            // basic.reject (not nack) increments the quorum queue's delivery count; the policy applies delay,
+            // delivery-limit and dead-lettering.
+            await _channel!.BasicRejectAsync(ea.DeliveryTag, requeue: true);
+            _logger.LogWarning("Message {MessageId} failed. Rejected for broker retry.", messageId);
+            return;
+        }
+
         var retryCount = MessageHelpers.GetRetryCount(ea);
 
-        if (_options.MaxRetries <= 0 || retryCount < _options.MaxRetries)
+        if (retryCount < _options.MaxRetries)
         {
             // Retry: republish with incremented retry header and ACK the original
             var headers = ea.BasicProperties?.Headers != null
@@ -238,9 +247,11 @@ internal sealed class MqConsumer : IAsyncDisposable
 
             // With ConfirmPublish a returned or rejected copy throws PublishException before the ACK below,
             // so the caller's fallback NACKs the original instead of acknowledging a lost copy.
+            // Back to this consumer's own queue via the default exchange, so a fanout/topic exchange
+            // doesn't hand the copy to every other bound queue again.
             await _channel!.BasicPublishAsync(
-                ea.Exchange ?? "",
-                ea.RoutingKey,
+                "",
+                _options.QueueName,
                 _connection!.ConfirmPublish, retryProps, ea.Body, CancellationToken.None);
 
             await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
