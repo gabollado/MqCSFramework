@@ -133,6 +133,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 4. Message body logging is controlled via Serilog log level configuration (Debug level) — use per-namespace overrides to enable/disable
 5. Sensitive field masking (configurable list of field names replaced with `***MASKED***`)
 6. Configuration (connection details, queue names, etc.) is read from `appsettings.json` — not hardcoded
+7. Connection and channel lifecycle events are logged for every sender and consumer: the endpoint connected to, connection shutdown (initiator, reply code and text), automatic recovery succeeded (with the endpoint reconnected to) or failed, channel shutdown, and exceptions raised inside the RabbitMQ client's callbacks. A shutdown the application started itself logs at Information, any other shutdown at Warning, recovery failures and callback exceptions at Error
 
 ### Requirement 9: Error Handling
 

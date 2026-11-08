@@ -58,8 +58,9 @@ The implementation language is C# 14 / .NET 10.
     - Map the `RabbitMqConnectionOptions` credentials, virtual host and client name to the factory
     - Parse `HostName` with `AmqpTcpEndpoint.ParseMultiple`, give each endpoint its own SSL option (enabled = `UseSsl`, server name = `SslServerName` when set, otherwise the endpoint's host), and connect with the endpoint list
     - Cap the connect at `RequestedConnectionTimeout` x number of endpoints with a token linked to the caller's; when the cap (not the caller) cancels it, throw `TimeoutException`
+    - Log the endpoint connected to, and attach lifecycle logging: connection `ConnectionShutdownAsync`, `RecoverySucceededAsync`, `ConnectionRecoveryErrorAsync`, `CallbackExceptionAsync`; channel `ChannelShutdownAsync`, `CallbackExceptionAsync`. Application-initiated shutdowns at Information, other shutdowns at Warning, errors at Error. Remember the current endpoint (updated on recovery) instead of reading `IConnection.Endpoint` in a shutdown handler
     - Implement `IAsyncDisposable` for graceful channel and connection close
-    - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6, 4.7_
+    - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6, 4.7, 8.7_
 
 - [ ] 4. Implement standard sender
   - [ ] 4.1 Create RabbitMqStandardSender internal class implementing IStandardSender

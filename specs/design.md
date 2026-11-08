@@ -354,7 +354,8 @@ Parameters:
 Returns: asynchronous method returning a channel object
 Behavior:
   Returns existing open channel if available.
-  Otherwise: closes stale channel, ensures connection is alive, creates new channel.
+  Otherwise: closes stale channel, ensures connection is alive, creates new channel and attaches
+  channel lifecycle logging to it.
   Thread-safe via semaphore (mutual exclusion lock).
 
 Method: ResetChannelAsync
@@ -383,6 +384,24 @@ Internal behavior (CreateConnection):
   forever when a server accepts TCP but never answers the AMQP handshake (e.g. plaintext to a TLS port).
   When the cap (not the caller) cancels the connect, throws TimeoutException naming the endpoints;
   a caller's cancellation propagates unchanged.
+  On success logs (Information) the endpoint it connected to and attaches connection lifecycle logging.
+
+Lifecycle logging (diagnostics only; recovery itself is done by the client):
+  Every line carries options.ClientProvidedName (or "unnamed").
+  Connection:
+    - ConnectionShutdownAsync: Information when the application closed it, otherwise Warning with
+      initiator, reply code, reply text and the shutdown exception, plus the endpoint it was on
+    - RecoverySucceededAsync: Information with the endpoint it reconnected to
+    - ConnectionRecoveryErrorAsync: Error with the exception
+    - CallbackExceptionAsync: Error with the exception
+  Channel:
+    - ChannelShutdownAsync: Information when the application closed it, otherwise Warning with
+      initiator, reply code, reply text and the shutdown exception. A channel-level error closes
+      only the channel and does not trigger the client's recovery, so this line is how it shows up
+    - CallbackExceptionAsync: Error with the exception (e.g. thrown by a consumer's delivery handler)
+  The current endpoint is remembered when connecting and updated on recovery, rather than read from
+  the connection inside a shutdown handler: the client's Endpoint property throws once the
+  connection is disposed.
 
 DisposeAsync behavior:
   Closes channel and connection gracefully, disposes the semaphore.
@@ -1368,6 +1387,7 @@ Two distinct cases:
 - All logging uses structured logging via a logging abstraction (ILogger)
 - Consumer wraps each message's processing in `logger.CorrelationScope(correlationId)` — every log entry during that message's processing includes the CorrelationId automatically
 - `LoggingExtensions.CorrelationScope()` is in the **core module** and usable by both consumer and sender/application code
+- Connection and channel lifecycle events (connected, shutdown, recovery, callback exceptions) are logged by `RabbitMqConnection` for every sender and consumer — see its "Lifecycle logging" block
 - Message body logging is at debug level — controlled via per-namespace log level overrides in configuration, not a boolean property
 - Sample projects configure a file-based logging sink writing to a configurable directory
 

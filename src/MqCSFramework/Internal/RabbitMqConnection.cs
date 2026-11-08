@@ -58,6 +58,7 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
             }
 
             _channel = await _connection.CreateChannelAsync(cancellationToken: ct);
+            AttachChannelLogging(_channel);
             return _channel;
         }
         finally
@@ -126,7 +127,7 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
 
         var endpointList = string.Join(", ", endpoints.Select(e => $"{e.HostName}:{e.Port}"));
         _logger.LogInformation("Connecting to RabbitMQ at {Endpoints}, vhost {VHost}, as {ClientName}",
-            endpointList, _options.VirtualHost, _options.ClientProvidedName ?? "unnamed");
+            endpointList, _options.VirtualHost, ClientName);
 
         // RabbitMQ.Client applies RequestedConnectionTimeout to the TCP connect only: when a server accepts
         // TCP but never answers the AMQP handshake (e.g. plaintext to a TLS port), CreateConnectionAsync can
@@ -135,14 +136,92 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
+        IConnection connection;
         try
         {
-            return await factory.CreateConnectionAsync(endpoints, timeoutCts.Token);
+            connection = await factory.CreateConnectionAsync(endpoints, timeoutCts.Token);
         }
         catch (OperationCanceledException ex) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
             throw new TimeoutException($"Timed out after {timeout.TotalSeconds:0}s connecting to RabbitMQ at {endpointList}.", ex);
         }
+
+        _logger.LogInformation("Connected to RabbitMQ at {Endpoint} as {ClientName}", connection.Endpoint.ToString(), ClientName);
+        AttachConnectionLogging(connection);
+        return connection;
+    }
+
+    private string ClientName => _options.ClientProvidedName ?? "unnamed";
+
+    /// <summary>
+    /// Logs connection lifecycle events so a dropped or recovered connection is visible.
+    /// Diagnostics only: recovery itself is done by the client (AutomaticRecoveryEnabled).
+    /// </summary>
+    private void AttachConnectionLogging(IConnection connection)
+    {
+        // Remembered here and updated on recovery: the client's Endpoint property throws once the
+        // connection is disposed, so the shutdown handler must not read it.
+        var endpoint = connection.Endpoint.ToString();
+
+        connection.ConnectionShutdownAsync += (_, args) =>
+        {
+            if (args.Initiator == ShutdownInitiator.Application)
+            {
+                _logger.LogInformation("RabbitMQ connection {ClientName} to {Endpoint} closed by the application", ClientName, endpoint);
+                return Task.CompletedTask;
+            }
+
+            _logger.LogWarning(args.Exception,
+                "RabbitMQ connection {ClientName} to {Endpoint} shut down - initiator {Initiator}, code {ReplyCode}, text {ReplyText}",
+                ClientName, endpoint, args.Initiator, args.ReplyCode, args.ReplyText);
+            return Task.CompletedTask;
+        };
+
+        connection.RecoverySucceededAsync += (_, _) =>
+        {
+            endpoint = connection.Endpoint.ToString();
+            _logger.LogInformation("RabbitMQ connection {ClientName} recovered, now connected to {Endpoint}", ClientName, endpoint);
+            return Task.CompletedTask;
+        };
+
+        connection.ConnectionRecoveryErrorAsync += (_, args) =>
+        {
+            _logger.LogError(args.Exception, "RabbitMQ connection {ClientName} failed to recover", ClientName);
+            return Task.CompletedTask;
+        };
+
+        connection.CallbackExceptionAsync += (_, args) =>
+        {
+            _logger.LogError(args.Exception, "RabbitMQ connection {ClientName} callback threw an exception", ClientName);
+            return Task.CompletedTask;
+        };
+    }
+
+    /// <summary>
+    /// Logs channel lifecycle events. A channel-level error closes only the channel and does not
+    /// trigger the client's recovery, so this is how such a failure shows up.
+    /// </summary>
+    private void AttachChannelLogging(IChannel channel)
+    {
+        channel.ChannelShutdownAsync += (_, args) =>
+        {
+            if (args.Initiator == ShutdownInitiator.Application)
+            {
+                _logger.LogInformation("RabbitMQ channel on connection {ClientName} closed by the application", ClientName);
+                return Task.CompletedTask;
+            }
+
+            _logger.LogWarning(args.Exception,
+                "RabbitMQ channel on connection {ClientName} shut down - initiator {Initiator}, code {ReplyCode}, text {ReplyText}",
+                ClientName, args.Initiator, args.ReplyCode, args.ReplyText);
+            return Task.CompletedTask;
+        };
+
+        channel.CallbackExceptionAsync += (_, args) =>
+        {
+            _logger.LogError(args.Exception, "RabbitMQ channel on connection {ClientName} callback threw an exception", ClientName);
+            return Task.CompletedTask;
+        };
     }
 
     public async ValueTask DisposeAsync()
