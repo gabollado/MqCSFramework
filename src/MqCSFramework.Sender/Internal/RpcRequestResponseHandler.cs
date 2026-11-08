@@ -9,23 +9,26 @@ namespace MqCSFramework.Sender.Internal;
 /// <summary>
 /// Manages the reply queue consumer for RPC responses.
 /// Owns the pending request dictionary and handles the full correlation lifecycle:
-/// ensure started, register pending, publish, await reply, timeout, cleanup.
+/// ensure the reply consumer, register pending, publish, await reply, timeout, cleanup.
 /// </summary>
 internal sealed class RpcRequestResponseHandler : IDisposable
 {
+    /// <summary>The channel the reply consumer is registered on and the reply queue it consumes.</summary>
+    private sealed record ReplyRegistration(IChannel Channel, string QueueName);
+
     private readonly RabbitMqConnection _connection;
-    private readonly string _replyQueueName;
+    private readonly string _replyQueuePrefix;
     private readonly ILogger _logger;
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<byte[]>> _pending = new();
-    private bool _started;
 
-    public string ReplyQueueName => _replyQueueName;
+    // Replaced as one reference, so a reader never pairs a channel with another channel's queue name.
+    private volatile ReplyRegistration? _registration;
 
-    public RpcRequestResponseHandler(RabbitMqConnection connection, string replyQueueName, ILogger logger)
+    public RpcRequestResponseHandler(RabbitMqConnection connection, string replyQueuePrefix, ILogger logger)
     {
         _connection = connection;
-        _replyQueueName = replyQueueName;
+        _replyQueuePrefix = replyQueuePrefix;
         _logger = logger;
     }
 
@@ -43,7 +46,8 @@ internal sealed class RpcRequestResponseHandler : IDisposable
         TimeSpan timeout,
         CancellationToken ct)
     {
-        await EnsureStartedAsync(ct);
+        var reply = await EnsureReplyConsumerAsync(ct);
+        props.ReplyTo = reply.QueueName;
 
         // Pending calls are keyed by the per-message MessageId, which is unique per message and per
         // retry attempt. CorrelationId is NOT used for matching — it is a process-level trace id that
@@ -75,10 +79,10 @@ internal sealed class RpcRequestResponseHandler : IDisposable
 
         try
         {
-            var channel = await _connection.GetChannelAsync(ct);
-            // With ConfirmPublish this also waits for the broker's ack; a returned (no queue matched)
-            // or rejected request throws PublishException, which the sender does not retry.
-            await channel.BasicPublishAsync(exchange, routingKey, _connection.ConfirmPublish, props, body, ct);
+            // Publish on the channel the reply consumer listens on. With ConfirmPublish this also waits for
+            // the broker's ack; a returned (no queue matched) or rejected request throws PublishException,
+            // which the sender does not retry.
+            await reply.Channel.BasicPublishAsync(exchange, routingKey, _connection.ConfirmPublish, props, body, ct);
 
             return await tcs.Task;
         }
@@ -89,25 +93,37 @@ internal sealed class RpcRequestResponseHandler : IDisposable
         }
     }
 
-    private async Task EnsureStartedAsync(CancellationToken ct)
+    /// <summary>
+    /// Returns the channel to publish on and the reply queue for ReplyTo. Registers the reply consumer on
+    /// first use, and again whenever the connection hands out a different channel: the old consumer died
+    /// with its channel, and its auto-delete queue with it. A channel the client recovers automatically
+    /// stays the same instance (and the client re-registers its consumer), so it is left alone.
+    /// </summary>
+    private async Task<ReplyRegistration> EnsureReplyConsumerAsync(CancellationToken ct)
     {
-        if (_started)
+        var channel = await _connection.GetChannelAsync(ct);
+        var current = _registration;
+        if (current is not null && ReferenceEquals(current.Channel, channel))
         {
-            return;
+            return current;
         }
 
         await _initLock.WaitAsync(ct);
         try
         {
-            if (_started)
+            channel = await _connection.GetChannelAsync(ct);
+            current = _registration;
+            if (current is not null && ReferenceEquals(current.Channel, channel))
             {
-                return;
+                return current;
             }
 
-            var channel = await _connection.GetChannelAsync(ct);
+            // A new name every time: if the previous connection died without a clean close, the broker can
+            // keep its exclusive queue until it notices, and redeclaring that name would fail.
+            var queueName = $"{_replyQueuePrefix}{Guid.NewGuid():N}";
 
             await channel.QueueDeclareAsync(
-                queue: _replyQueueName,
+                queue: queueName,
                 durable: false,
                 exclusive: true,
                 autoDelete: true,
@@ -117,10 +133,20 @@ internal sealed class RpcRequestResponseHandler : IDisposable
             var consumer = new AsyncEventingBasicConsumer(channel);
             consumer.ReceivedAsync += HandleReplyAsync;
 
-            await channel.BasicConsumeAsync(_replyQueueName, autoAck: true, consumer: consumer, cancellationToken: ct);
-            _started = true;
+            await channel.BasicConsumeAsync(queueName, autoAck: true, consumer: consumer, cancellationToken: ct);
 
-            _logger.LogInformation("RPC reply consumer started on queue '{ReplyQueue}'", _replyQueueName);
+            var registration = new ReplyRegistration(channel, queueName);
+            _registration = registration;
+
+            if (current is null)
+            {
+                _logger.LogInformation("RPC reply consumer started on queue '{ReplyQueue}'", queueName);
+                return registration;
+            }
+
+            _logger.LogWarning("RPC channel was replaced; reply consumer re-registered on queue '{ReplyQueue}' (was '{OldReplyQueue}')",
+                queueName, current.QueueName);
+            return registration;
         }
         finally
         {

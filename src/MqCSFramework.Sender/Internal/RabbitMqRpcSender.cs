@@ -9,7 +9,7 @@ namespace MqCSFramework.Sender.Internal;
 /// <summary>
 /// RPC (request-reply) sender implementation.
 /// Delegates reply correlation entirely to RpcRequestResponseHandler.
-/// Reply queue format: {routingKey}.reply.{GUID}
+/// Reply queue format: {routingKey}.reply.{GUID} (a new GUID each time the reply consumer is registered)
 /// </summary>
 internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
 {
@@ -24,8 +24,7 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
         _options = options;
         _logger = logger;
 
-        var replyQueueName = $"{options.RoutingKey}.reply.{Guid.NewGuid():N}";
-        _replyConsumer = new RpcRequestResponseHandler(connection, replyQueueName, logger);
+        _replyConsumer = new RpcRequestResponseHandler(connection, $"{options.RoutingKey}.reply.", logger);
     }
 
     public async Task<TResponse> SendAsync<TProcessor, TResponse, TRequest>(
@@ -88,7 +87,7 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
         {
             MessageId = messageId,
             CorrelationId = correlationId,
-            ReplyTo = _replyConsumer.ReplyQueueName,
+            // ReplyTo is set by the handler: the reply queue can change when the channel is replaced.
             Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
             ContentType = "application/json",
             // Delivery mode 2: survives a broker restart in a durable classic queue.

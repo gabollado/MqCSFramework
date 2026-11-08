@@ -144,8 +144,8 @@ Consumer side:
 2. Framework serializes request to UTF-8 JSON
 3. Framework generates a fresh `MessageId` (new GUID in "N" format) for this attempt — this is the unique request/response match key. The caller's `correlationId` is a process-level trace id that may be shared across many messages and is NOT unique per request
 4. Framework sets headers: `mq-processor-type`, `mq-pattern` = `"rpc"`, `mq-cancellation-deadline` = `(currentUtcTime + timeout).Ticks` as string. Sets `MessageId` = the generated match key and `CorrelationId` = the caller's trace id
-5. Sets `ReplyTo` = reply queue name (format: `{routingKey}.reply.{GUID:N}`)
-6. `RpcRequestResponseHandler` lazily declares the exclusive auto-delete reply queue, starts consuming
+5. `RpcRequestResponseHandler` makes sure its reply consumer is registered on the channel it is about to publish on: it lazily declares the exclusive auto-delete reply queue and starts consuming, and does so again under a new name whenever the connection hands out a different channel
+6. Sets `ReplyTo` = the current reply queue name (format: `{routingKey}.reply.{GUID:N}`)
 7. Registers a pending completion source keyed by `MessageId`, publishes, awaits response
 8. On timeout: `RpcTimeoutException` (via linked cancellation with timeout). Timeout is a client-side concern — the sender stopped waiting. If `MaxExceptionRetries > 0`, the sender waits `ExceptionRetryDelay` and resends (with a NEW `MessageId`, same `correlationId`) before giving up (see RabbitMqRpcSender behavior); the final exception is thrown only after all attempts are exhausted
 9. Consumer receives, resolves processor, calls `ProcessRawRpcAsync` which returns the serialized `TResponse` bytes
@@ -629,8 +629,9 @@ Constructor parameters:
   - options: RpcSenderOptions
   - logger: logger instance
 Constructor behavior:
-  Generates reply queue name: "{options.RoutingKey}.reply.{newGUID:N}"
-  Creates a RpcRequestResponseHandler with the connection, reply queue name, and logger.
+  Creates a RpcRequestResponseHandler with the connection, the reply queue prefix
+  "{options.RoutingKey}.reply.", and logger. The handler appends a new GUID each time it registers
+  the reply consumer, and sets ReplyTo itself.
 
 SendAsync behavior:
   1. Determine routingKey = options.RoutingKey if provided, else sender's default RoutingKey
@@ -728,14 +729,16 @@ Class: RpcRequestResponseHandler
 Implements: disposable/cleanup pattern
 Fields:
   - connection: RabbitMqConnection
-  - replyQueueName: string (read-only property: ReplyQueueName)
+  - replyQueuePrefix: string ("{routingKey}.reply.")
   - logger: logger instance
   - initLock: semaphore (initially 1)
   - pending: concurrent/thread-safe dictionary of string → completion source of byte array
-  - started: boolean (initially false)
+  - registration: volatile reference to an immutable (channel, queueName) pair, or null before first use.
+      The channel the reply consumer is registered on and the queue it consumes, replaced together in
+      one assignment so readers never see a channel paired with another channel's queue name
 Constructor parameters:
   - connection: RabbitMqConnection
-  - replyQueueName: string
+  - replyQueuePrefix: string
   - logger: logger instance
 
 Method: PublishAndAwaitReplyAsync
@@ -750,7 +753,7 @@ Parameters:
   - cancellationToken: cancellation token
 Returns: asynchronous method returning byte array (the raw response bytes)
 Behavior:
-  1. Call EnsureStartedAsync to guarantee the reply consumer is running
+  1. Call EnsureReplyConsumerAsync to get the (channel, queueName) registration; set props.ReplyTo = queueName
   2. Create a new completion source (with RunContinuationsAsynchronously flag)
   3. Store it in the pending dictionary keyed by messageId (NOT correlationId — correlationId is not unique per message)
   4. Create a linked cancellation source (from the caller's token) that also cancels after the timeout duration
@@ -758,25 +761,36 @@ Behavior:
      caused the cancellation — complete the pending task as canceled (OperationCanceledException); otherwise
      (the timeout fired) set RpcTimeoutException. This lets callers and the sender's exception-retry logic
      distinguish a caller cancellation (not retryable) from a timeout (retryable)
-  6. Get channel from connection, publish the message (mandatory = connection.ConfirmPublish; with
-     confirms on, the publish awaits the broker's ack and a return or nack throws PublishException)
+  6. Publish the message on the registration's channel, the one the reply consumer listens on
+     (mandatory = connection.ConfirmPublish; with confirms on, the publish awaits the broker's ack and
+     a return or nack throws PublishException)
   7. Await the completion source's result
   8. On failure before completion: remove pending entry (by messageId), re-throw
 
-Method: EnsureStartedAsync (private)
+Method: EnsureReplyConsumerAsync (private)
 Parameters:
   - cancellationToken: cancellation token
+Returns: the current (channel, queueName) registration
 Behavior:
-  If already started, return immediately.
-  Acquire the init lock.
-  Double-check started flag (double-checked locking pattern).
-  Get channel from connection.
-  Declare queue: name=replyQueueName, durable=false, exclusive=true, autoDelete=true, no arguments.
-  Create an async event consumer, attach HandleReplyAsync to its received event.
-  Start consuming with autoAck=true.
-  Set started=true.
-  Log info: "RPC reply consumer started on queue '{ReplyQueue}'"
+  Get channel from connection. If the registration exists and its channel is that same instance,
+  return it (fast path, no lock).
+  Acquire the init lock; repeat the check with a fresh GetChannelAsync (double-checked locking).
+  Otherwise (first use, or the connection handed out a different channel because the previous one
+  closed, or the connection itself was rebuilt):
+    queueName = replyQueuePrefix + new GUID ("N"). A new name every time: if the previous connection
+    died without a clean close, the broker can keep its exclusive queue until it notices, and
+    redeclaring that name would fail with RESOURCE_LOCKED.
+    Declare queue: name=queueName, durable=false, exclusive=true, autoDelete=true, no arguments.
+    Create an async event consumer, attach HandleReplyAsync to its received event.
+    Start consuming with autoAck=true.
+    Store the new (channel, queueName) registration.
+    Log info "RPC reply consumer started on queue '{ReplyQueue}'" on first use, or warning
+    "RPC channel was replaced; reply consumer re-registered on queue '{ReplyQueue}' (was '{OldReplyQueue}')".
   Release the lock.
+  Comparing channel instances is what makes this safe with automatic recovery: the client recovers a
+  channel in place (same instance) and re-registers its consumers itself, so no second consumer is
+  added; only a channel instance the framework created anew gets a fresh registration.
+  Requests already published with the old ReplyTo get no reply (their queue is gone) and time out.
 
 Method: HandleReplyAsync (private, event handler)
 Behavior:
@@ -1383,7 +1397,7 @@ rpcSender = services.GetRequiredKeyedService<IRpcSender>("stock")
 
 All GUIDs generated by the framework use "N" format (32 hex digits, no hyphens):
 - MessageId: `NewGuid().ToString("N")`
-- Reply queue name: `"{options.RoutingKey}.reply.{NewGuid():N}"`
+- Reply queue name: `"{options.RoutingKey}.reply.{NewGuid():N}"` — a new GUID each time the reply consumer is (re)registered
 
 ### Correlation ID
 

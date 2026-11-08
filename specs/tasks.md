@@ -97,6 +97,7 @@ The implementation language is C# 14 / .NET 10.
     - Exception-retry loop: on an exceptional failure (timeout, transport/broker error, or response-deserialization failure) wait `ExceptionRetryDelayMs` and resend, up to `MaxExceptionRetries` additional attempts (fresh messageId per attempt, caller correlationId reused); honor the caller's CancellationToken across attempts and the delay; throw the last exception when exhausted. Never retry a business `Success = false` response; never retry request-serialization failure
     - Implement `HandleReply` method called by the reply consumer; match the reply to a pending call by the reply's `MessageId`
     - Publish requests with `mandatory = connection.ConfirmPublish`; exclude `PublishException` from the exception-retry filter so a returned or rejected request fails at once
+    - Keep the reply consumer bound to the channel being published on: hold one immutable (channel, queueName) registration; when `GetChannelAsync` returns a different channel instance, declare a new `{routingKey}.reply.{GUID}` queue, consume it, replace the registration, and set `ReplyTo` from it; publish on that registration's channel
     - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.11, 2.12, 2.13, 2.14, 2.15_
 
   - [ ]* 5.2 Write property test for RPC round-trip matching
