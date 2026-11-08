@@ -38,8 +38,6 @@ Unchanged from the original assessment: the problem (typed messaging over Rabbit
 
 This is stated as fact, not speculation — it's the project's own description of itself. It's relevant to a due-diligence audit for two reasons: it plausibly explains why the code is unusually consistent for a 2-week-old solo project (much of it is templated from a design spec rather than accreted organically), and it sets up a direct, falsifiable test of the project's own claimed process discipline — a test the project currently fails in two places (§6, §8).
 
-Separately, `specs/steering/workflow-rules.md` contains the line *"All references to the company (xximo, XXImo) must be excluded from the project."* Noted factually and without further speculation: this suggests the framework may have originated from or alongside internal/company work rather than being designed from inception as a general-purpose open-source library. This doesn't change the technical assessment, but it's a relevant provenance fact for anyone evaluating long-term maintenance intent.
-
 ---
 
 ## 3. Architecture Analysis

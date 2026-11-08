@@ -81,6 +81,8 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 2. A single service can have senders connected to different RabbitMQ clusters
 3. One connection failing does not affect others
 4. Connections auto-reconnect on failure
+5. The host setting accepts one or more comma-separated `host` or `host:port` entries (the nodes of one cluster). An entry without a port uses the AMQP default (5672, or 5671 with TLS). The client tries the entries in random order for the initial connection and again when it auto-reconnects
+6. TLS, when enabled, applies to every host. The certificate name checked is a configurable server name, or each host's own name when none is set
 
 ### Requirement 5: DI Integration
 

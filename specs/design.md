@@ -44,7 +44,7 @@ src/
 │   ├── MessageContext                      ← Metadata data class passed to processors
 │   ├── MqHeaders                           ← Well-known header name constants
 │   ├── Configuration/
-│   │   └── RabbitMqConnectionOptions       ← Connection settings (host, port, credentials, SSL)
+│   │   └── RabbitMqConnectionOptions       ← Connection settings (hosts with optional ports, credentials, SSL)
 │   ├── RpcResponse                         ← Abstract base record all RPC responses extend (Error + derived Success)
 │   ├── RpcError                            ← Error value object (Code + Message)
 │   ├── Exceptions/
@@ -266,12 +266,15 @@ Configuration class for RabbitMQ connection settings. Each sender/consumer carri
 ```
 Class: RabbitMqConnectionOptions
 Properties:
-  - HostName: string (default "localhost")
-  - Port: integer (default 5672)
+  - HostName: string (default "localhost") - one or more comma-separated "host" or "host:port" entries
+      (the nodes of one cluster). An entry without a port uses 5672, or 5671 when UseSsl is true.
+      There is no separate port property
   - UserName: string (default "guest")
   - Password: string (default "guest")
   - VirtualHost: string (default "/")
-  - UseSsl: boolean (default false)
+  - UseSsl: boolean (default false) - TLS for every host
+  - SslServerName: string or null (default null) - certificate name checked for every host;
+      when null or empty, each host is checked against its own name
   - ClientProvidedName: string or null (default null)
 ```
 
@@ -360,12 +363,18 @@ Behavior:
 
 Internal behavior (CreateConnection):
   Creates a connection factory with:
-    HostName, Port, UserName, Password, VirtualHost from options
+    UserName, Password, VirtualHost from options
     AutomaticRecoveryEnabled = true
     TopologyRecoveryEnabled = true
     ClientProvidedName = options.ClientProvidedName
-    SSL enabled = options.UseSsl (ServerName = HostName)
-  Calls factory's async create connection method.
+  Parses options.HostName with the client's multi-endpoint parser (AmqpTcpEndpoint.ParseMultiple:
+    comma-separated, optional ":port", IPv6 in brackets). An entry without a port resolves to 5672,
+    or 5671 once TLS is enabled on it.
+  Gives each endpoint its own SSL option: enabled = options.UseSsl, ServerName = options.SslServerName
+    when set, otherwise that endpoint's host (so a node presenting its own certificate validates
+    against its own name).
+  Calls the factory's async create connection method with the endpoint list. The client tries the
+  endpoints in random order, for the initial connection and again on automatic recovery.
 
 DisposeAsync behavior:
   Closes channel and connection gracefully, disposes the semaphore.
@@ -1242,7 +1251,6 @@ rpcSender = services.GetRequiredKeyedService<IRpcSender>("stock")
       "orders": {
         "Connection": {
           "HostName": "localhost",
-          "Port": 5672,
           "UserName": "guest",
           "Password": "guest",
           "VirtualHost": "/",
@@ -1256,8 +1264,7 @@ rpcSender = services.GetRequiredKeyedService<IRpcSender>("stock")
     "RpcSenders": {
       "stock": {
         "Connection": {
-          "HostName": "localhost",
-          "Port": 5672,
+          "HostName": "rabbit-1:5672,rabbit-2:5672",
           "UserName": "guest",
           "Password": "guest"
         },
@@ -1322,7 +1329,7 @@ Each `RabbitMqConnection` creates a connection factory with:
 - AutomaticRecoveryEnabled = true
 - TopologyRecoveryEnabled = true
 
-The RabbitMQ client library handles reconnection internally. The framework relies on this rather than implementing custom reconnect logic.
+The RabbitMQ client library handles reconnection internally. The framework relies on this rather than implementing custom reconnect logic. When `HostName` lists several hosts, recovery reconnects to any of them.
 
 ### Channel Reset on Failure
 

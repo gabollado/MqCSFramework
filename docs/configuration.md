@@ -78,25 +78,35 @@ Embedded in each sender/consumer. Every endpoint has its own independent connect
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `HostName` | string | `"localhost"` | RabbitMQ server hostname |
-| `Port` | int | `5672` | AMQP port (use 5671 for AMQPS/SSL) |
+| `HostName` | string | `"localhost"` | One or more comma-separated `host` or `host:port` entries (the nodes of one cluster). An entry without a port uses 5672, or 5671 with `UseSsl`. With several entries the client tries them in random order on connect and on recovery |
 | `UserName` | string | `"guest"` | Authentication username |
 | `Password` | string | `"guest"` | Authentication password |
 | `VirtualHost` | string | `"/"` | RabbitMQ virtual host |
-| `UseSsl` | bool | `false` | Enable SSL/TLS connection |
+| `UseSsl` | bool | `false` | Enable SSL/TLS for every host |
+| `SslServerName` | string? | `null` | Certificate name checked for every host. When empty, each host is checked against its own name |
 | `ClientProvidedName` | string? | `null` | Connection name visible in RabbitMQ management UI |
+
+There is no separate `Port` setting: put a non-default port in `HostName` (`"rabbit.example.com:5673"`).
 
 ### Example
 
 ```json
 "Connection": {
   "HostName": "rabbit.example.com",
-  "Port": 5671,
   "UserName": "myapp",
   "Password": "secret",
   "VirtualHost": "/production",
   "UseSsl": true,
   "ClientProvidedName": "order-service-sender"
+}
+```
+
+### Cluster example
+
+```json
+"Connection": {
+  "HostName": "rabbit-1.example.com:5671,rabbit-2.example.com:5671,rabbit-3.example.com:5671",
+  "UseSsl": true
 }
 ```
 
@@ -174,7 +184,6 @@ Configuration for a message consumer.
   "orders": {
     "Connection": {
       "HostName": "rabbit.example.com",
-      "Port": 5671,
       "UserName": "consumer",
       "Password": "secret",
       "VirtualHost": "/production",

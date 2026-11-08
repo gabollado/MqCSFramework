@@ -37,7 +37,7 @@ The implementation language is C# 14 / .NET 10.
     - _Requirements: 1.1, 1.2, 2.1, 2.2_
 
   - [ ] 2.3 Create configuration options classes
-    - Create `RabbitMqConnectionOptions` (HostName, Port, UserName, Password, VirtualHost, UseSsl, ClientProvidedName)
+    - Create `RabbitMqConnectionOptions` (HostName [comma-separated `host` or `host:port`, no separate port property], UserName, Password, VirtualHost, UseSsl, SslServerName, ClientProvidedName)
     - Create `StandardSenderOptions` (Connection, Exchange, RoutingKey)
     - Create `RpcSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 30000], MaxExceptionRetries [default 0], ExceptionRetryDelayMs [int ms, default 1000])
     - Create `ConsumerOptions` (Connection, QueueName, PrefetchCount, MaxRetries, DeadLetterExchange, DeadLetterRoutingKey, SuppressMessageBodyLogging, MaskedFields)
@@ -55,9 +55,10 @@ The implementation language is C# 14 / .NET 10.
   - [ ] 3.1 Create RabbitMqConnection internal class
     - Implement lazy connection and channel creation via `GetChannelAsync(CancellationToken ct)`
     - Use `ConnectionFactory` with `AutomaticRecoveryEnabled = true`
-    - Map all `RabbitMqConnectionOptions` properties to the factory (host, port, credentials, virtual host, SSL, client name)
+    - Map the `RabbitMqConnectionOptions` credentials, virtual host and client name to the factory
+    - Parse `HostName` with `AmqpTcpEndpoint.ParseMultiple`, give each endpoint its own SSL option (enabled = `UseSsl`, server name = `SslServerName` when set, otherwise the endpoint's host), and connect with the endpoint list
     - Implement `IAsyncDisposable` for graceful channel and connection close
-    - _Requirements: 4.1, 4.3, 4.4_
+    - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6_
 
 - [ ] 4. Implement standard sender
   - [ ] 4.1 Create RabbitMqStandardSender internal class implementing IStandardSender

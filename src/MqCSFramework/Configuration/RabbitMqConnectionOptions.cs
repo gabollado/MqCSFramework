@@ -5,12 +5,29 @@ namespace MqCSFramework;
 /// </summary>
 public sealed class RabbitMqConnectionOptions
 {
+    /// <summary>
+    /// One or more comma-separated "host" or "host:port" entries, e.g. "rabbit-1:5671,rabbit-2:5671"
+    /// for the nodes of one cluster. An entry without a port uses 5672, or 5671 when <see cref="UseSsl"/>
+    /// is true. With several entries the client tries them in random order for the initial connection
+    /// and again on automatic recovery.
+    /// </summary>
     public string HostName { get; set; } = "localhost";
-    public int Port { get; set; } = 5672;
+
     public string UserName { get; set; } = "guest";
     public string Password { get; set; } = "guest";
     public string VirtualHost { get; set; } = "/";
+
+    /// <summary>
+    /// Enables TLS for every host in <see cref="HostName"/>.
+    /// </summary>
     public bool UseSsl { get; set; }
+
+    /// <summary>
+    /// Certificate name checked for every host when <see cref="UseSsl"/> is true.
+    /// When null or empty, each host is checked against its own name.
+    /// </summary>
+    public string? SslServerName { get; set; }
+
     public string? ClientProvidedName { get; set; }
 
     /// <summary>

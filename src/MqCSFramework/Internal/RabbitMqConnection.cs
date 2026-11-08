@@ -91,8 +91,6 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
     {
         var factory = new ConnectionFactory
         {
-            HostName = _options.HostName,
-            Port = _options.Port,
             UserName = _options.UserName,
             Password = _options.Password,
             VirtualHost = _options.VirtualHost,
@@ -110,19 +108,26 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
             factory.ConsumerDispatchConcurrency = concurrency;
         }
 
-        if (_options.UseSsl)
+        // The client's own parser: comma-separated "host" or "host:port" entries, IPv6 in brackets.
+        // An entry without a port resolves to 5672, or 5671 once TLS is enabled on it.
+        var endpoints = AmqpTcpEndpoint.ParseMultiple(_options.HostName);
+
+        // Each endpoint gets its own TLS settings, so without SslServerName a node presenting its own
+        // certificate is checked against its own name. The client picks endpoints in random order
+        // for the initial connection and for automatic recovery.
+        foreach (var endpoint in endpoints)
         {
-            factory.Ssl = new SslOption
+            endpoint.Ssl = new SslOption
             {
-                Enabled = true,
-                ServerName = _options.HostName
+                Enabled = _options.UseSsl,
+                ServerName = string.IsNullOrEmpty(_options.SslServerName) ? endpoint.HostName : _options.SslServerName
             };
         }
 
-        _logger.LogInformation("Connecting to RabbitMQ at {Host}:{Port}/{VHost} as {ClientName}",
-            _options.HostName, _options.Port, _options.VirtualHost, _options.ClientProvidedName ?? "unnamed");
+        _logger.LogInformation("Connecting to RabbitMQ at {Endpoints}, vhost {VHost}, as {ClientName}",
+            string.Join(", ", endpoints.Select(e => $"{e.HostName}:{e.Port}")), _options.VirtualHost, _options.ClientProvidedName ?? "unnamed");
 
-        var connection = await factory.CreateConnectionAsync(ct);
+        var connection = await factory.CreateConnectionAsync(endpoints, ct);
         return connection;
     }
 

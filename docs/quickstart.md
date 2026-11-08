@@ -108,7 +108,6 @@ Console.WriteLine($"Available: {response.Available}");
       "orders": {
         "Connection": {
           "HostName": "localhost",
-          "Port": 5672,
           "UserName": "guest",
           "Password": "guest",
           "VirtualHost": "/"
@@ -121,7 +120,6 @@ Console.WriteLine($"Available: {response.Available}");
       "stock": {
         "Connection": {
           "HostName": "localhost",
-          "Port": 5672,
           "UserName": "guest",
           "Password": "guest",
           "VirtualHost": "/"
@@ -135,7 +133,6 @@ Console.WriteLine($"Available: {response.Available}");
       "orders": {
         "Connection": {
           "HostName": "localhost",
-          "Port": 5672,
           "UserName": "guest",
           "Password": "guest",
           "VirtualHost": "/"
@@ -146,7 +143,6 @@ Console.WriteLine($"Available: {response.Available}");
       "stock": {
         "Connection": {
           "HostName": "localhost",
-          "Port": 5672,
           "UserName": "guest",
           "Password": "guest",
           "VirtualHost": "/"
@@ -229,4 +225,4 @@ Management UI: http://localhost:15672 (guest/guest). The default `appsettings.js
 
 1. Create a free account at https://www.cloudamqp.com/
 2. Create an instance, copy connection details
-3. Put them in `appsettings.local.json` (git-ignored) with `"UseSsl": true` and `"Port": 5671`
+3. Put them in `appsettings.local.json` (git-ignored) with `"UseSsl": true` (the port then defaults to 5671)

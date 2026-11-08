@@ -25,6 +25,5 @@ This rule exists because the developer WILL delete all code and regenerate from 
 - The sender specifies the processor contract interface as a generic parameter for compile-time type safety
 - Each sender/consumer has its own independent RabbitMQ connection
 - Two sender interfaces: `IStandardSender` and `IRpcSender`
-- All references to the company (xximo, XXImo) must be excluded from the project
 - Prefer early returns over if/else chains — if a branch ends with return, throw, or exits, don't use else
 - Prefer inverting conditions when the shorter/simpler branch can return early, keeping the longer logic at the top level to reduce nesting

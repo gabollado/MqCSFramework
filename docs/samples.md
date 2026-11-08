@@ -125,7 +125,7 @@ Management UI: http://localhost:15672 (guest/guest)
 1. Go to https://www.cloudamqp.com/ and create a free account
 2. Create a new instance (free "Little Lemur" plan)
 3. Copy the connection details (host, user, password, vhost) into your `appsettings.local.json`
-4. Use port 5671 with `UseSsl: true` for cloud instances
+4. Set `UseSsl: true` for cloud instances (the port then defaults to 5671)
 
 ### Queue Configuration
 

@@ -1,3 +1,8 @@
+---
+inclusion: fileMatch
+fileMatchPattern: 'MqCSFramework/**'
+---
+
 # MqCSFramework Project Standards
 
 All project workflow rules and conventions are defined in:
