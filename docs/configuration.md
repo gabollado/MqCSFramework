@@ -70,6 +70,12 @@ builder.Services.AddMqCSFramework(mq =>
 
 The `<name>` key is used as the keyed service name for DI injection.
 
+### Unknown keys
+
+When senders and consumers are registered from configuration, every key under their section that matches no setting (case-insensitive, including inside `Connection`) is logged as a **warning** with its full path, e.g. `MqCSFramework:Senders:orders:Connection:Port`. Sender warnings appear when the sender is first created, consumer warnings when the consumer starts.
+
+The key is still ignored, so a key you disabled on purpose (for example by renaming it) doesn't stop the application. Watch for these warnings after upgrading: a setting that was renamed or removed shows up there, such as the old `Port` (ports now go in `HostName`).
+
 ---
 
 ## RabbitMqConnectionOptions

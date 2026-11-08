@@ -166,13 +166,16 @@ The implementation language is C# 14 / .NET 10.
     - Implement `AddRpcSender(string name, Action<RpcSenderOptions> configure)` — registers a keyed `IRpcSender` singleton with its own `RabbitMqConnection`
     - Implement `AddConsumer(string name, Action<ConsumerOptions> configure)` — stores consumer registrations
     - Implement `Build()` — registers `ConsumerHostedService` as a hosted service if any consumers are configured
-    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
+    - Create internal static `ConfigurationChecks` in the core module (`FindUnknownKeys`, `LogUnknownKeys`)
+    - When registering from configuration, collect unknown keys per sender/consumer and log them as warnings when the sender is created or the consumer starts
+    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.10_
 
   - [ ] 9.2 Create ConsumerHostedService internal class extending BackgroundService
     - Accept consumer registrations, `IServiceProvider`, and `ILoggerFactory` via constructor
     - In `ExecuteAsync`: create `MqConsumer` instances for each registration, start them all in parallel
     - On cancellation token trigger: dispose all consumers gracefully
-    - _Requirements: 6.1, 6.2, 6.3_
+    - Log each registration's unknown configuration keys as warnings before starting its consumer
+    - _Requirements: 5.10, 6.1, 6.2, 6.3_
 
   - [ ]* 9.3 Write unit tests for DI registration and builder
     - Test that `AddSender` registers keyed `IStandardSender` resolvable via `GetRequiredKeyedService`

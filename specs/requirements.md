@@ -106,6 +106,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 7. `mq.BindConfiguration(IConfigurationSection)` auto-registers all senders/rpcSenders/consumers from config sections
 8. Senders are injected via `[FromKeyedServices("name")] IStandardSender sender`
 9. Configuration binds from `IConfiguration` (appsettings.json)
+10. When senders and consumers are registered from configuration, every key under their section that matches no setting (checked recursively into `Connection`) is logged as a warning with its full configuration path, e.g. `MqCSFramework:Senders:orders:Connection:Port`. Such keys are still ignored, so a key disabled on purpose (for example by renaming it) does not stop the application. Sender warnings are logged when the sender is first created; consumer warnings when the consumer starts
 
 ### Requirement 6: Consumer Hosting
 

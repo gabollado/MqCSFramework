@@ -29,6 +29,7 @@ The key design principle is **simplicity**: no transport abstraction, no routing
 | RabbitMQ client library (fully async API) | Core, Sender, Consumer | Broker communication |
 | Logging abstractions | Core, Sender, Consumer | Structured logging |
 | DI abstractions (keyed/named services) | Sender, Consumer | DI registration |
+| Configuration abstractions | Core | Reading config sections for the unknown-key check |
 | Configuration binding | Sender, Consumer | Config binding |
 | Hosting abstractions (background service) | Consumer | Background service hosting |
 | JSON serializer (built-in) | All | Message serialization |
@@ -51,7 +52,8 @@ src/
 │   │   ├── MessageSerializationException
 │   │   └── RpcTimeoutException
 │   └── Internal/
-│       └── RabbitMqConnection              ← Lazy connection/channel management with auto-recovery
+│       ├── RabbitMqConnection              ← Lazy connection/channel management with auto-recovery
+│       └── ConfigurationChecks             ← Unknown configuration key detection and logging
 │
 ├── MqCSFramework.Sender/                   ← Sender module
 │   ├── IStandardSender                     ← Public interface for fire-and-forget sends
@@ -419,6 +421,26 @@ DisposeAsync behavior:
   Closes channel and connection gracefully, disposes the semaphore.
 ```
 
+#### ConfigurationChecks (Internal, static)
+
+Unknown configuration key detection shared by the Sender and Consumer modules.
+
+```
+Method: FindUnknownKeys(section: configuration section, optionsType: type) -> read-only list of string
+  Returns the full configuration path of every key under section that the configuration binder
+  would not bind to optionsType, recursing into nested settings objects (e.g. Connection).
+  A key matches a public instance property with a public setter, compared case-insensitively
+  (the binder's rule). Recursion applies to class-typed properties other than string and
+  collections; collection items and scalar values have no named keys to check.
+
+Method: LogUnknownKeys(logger, unknownKeys: read-only list of string)
+  For each key: log warning "Configuration key '{Key}' is not a known MqCSFramework setting and is
+  ignored. It may be misspelled, or a setting that was renamed or removed."
+```
+
+Unknown keys are warnings, not errors, so a key that is disabled on purpose (e.g. renamed with a
+prefix) or meant for a newer version does not stop the application.
+
 ### Module: MqCSFramework.Sender
 
 #### IStandardSender
@@ -535,8 +557,11 @@ Behavior:
   Creates StandardSenderOptions, invokes the configure callback.
   Registers a keyed singleton factory that:
     - Resolves a logger from the service provider
+    - Logs the unknown configuration keys collected at registration (ConfigurationChecks.LogUnknownKeys;
+      none for this manual overload)
     - Creates a new RabbitMqConnection with the configured options
     - Creates and returns a new RabbitMqStandardSender
+  Both public methods delegate to one private registration method that takes the unknown keys.
 ```
 
 **Method: AddMqRpcSender**
@@ -554,6 +579,7 @@ Behavior:
   Creates RpcSenderOptions, invokes the configure callback.
   Registers a keyed singleton factory that:
     - Resolves a logger from the service provider
+    - Logs the unknown configuration keys collected at registration (none for this manual overload)
     - Creates a new RabbitMqConnection with the configured options
     - Creates and returns a new RabbitMqRpcSender
 ```
@@ -570,8 +596,9 @@ Parameters:
 Returns: the service collection (for chaining)
 Behavior:
   Gets the config section by sectionName.
-  Iterates "Senders" children: for each, calls AddMqSender with child key as name, binding options from config.
-  Iterates "RpcSenders" children: for each, calls AddMqRpcSender with child key as name, binding options from config.
+  Iterates "Senders" children: for each, registers a standard sender with child key as name, binding
+    options from config, and passes ConfigurationChecks.FindUnknownKeys(child, StandardSenderOptions).
+  Iterates "RpcSenders" children: same with RpcSenderOptions.
 ```
 
 #### RabbitMqStandardSender (Internal)
@@ -891,7 +918,8 @@ Returns: the service collection (for chaining)
 Behavior:
   Validates name is not null/whitespace.
   Creates ConsumerOptions, invokes the configure callback.
-  Stores a ConsumerRegistration(name, options) as a singleton in DI.
+  Stores a ConsumerRegistration(name, options, unknownKeys) as a singleton in DI (unknownKeys empty
+    for this manual overload; both public methods delegate to one private method that takes them).
   Registers the ConsumerHostedService as a hosted/background service (idempotent).
 ```
 
@@ -907,7 +935,8 @@ Parameters:
 Returns: the service collection (for chaining)
 Behavior:
   Gets the config section by sectionName.
-  Iterates "Consumers" children: for each, calls AddMqConsumer with child key as name, binding options from config.
+  Iterates "Consumers" children: for each, registers a consumer with child key as name, binding options
+    from config, and passes ConfigurationChecks.FindUnknownKeys(child, ConsumerOptions).
 ```
 
 #### ConsumerRegistration (Internal)
@@ -917,6 +946,7 @@ Data class: ConsumerRegistration (immutable, internal)
 Properties:
   - Name: string
   - Options: ConsumerOptions
+  - UnknownKeys: read-only list of strings - configuration paths that matched no setting
 ```
 
 #### ConsumerHostedService (Internal)
@@ -942,6 +972,7 @@ Execute behavior (runs on background thread):
   1. If no registrations: log warning "No consumers registered", idle indefinitely until cancellation, return
   2. Log info "Starting {Count} consumer(s)"
   3. For each registration:
+     - ConfigurationChecks.LogUnknownKeys(logger, registration.UnknownKeys)
      - Create a new MqConsumer with registration.Options, scopeFactory, and a new logger
      - Add to consumers list
      - Call consumer.StartAsync(cancellationToken)
@@ -1622,6 +1653,7 @@ src/
 | RabbitMQ.Client | 7.2.1 | Core, Sender, Consumer |
 | Microsoft.Extensions.Logging.Abstractions | 10.0.10 | Core, Sender, Consumer |
 | Microsoft.Extensions.DependencyInjection.Abstractions | 10.0.10 | Sender, Consumer |
+| Microsoft.Extensions.Configuration.Abstractions | 10.0.10 | Core (unknown-key check in ConfigurationChecks) |
 | Microsoft.Extensions.Configuration.Binder | 10.0.10 | Sender, Consumer |
 | Microsoft.Extensions.Hosting.Abstractions | 10.0.10 | Consumer |
 | System.Text.Json | (built-in) | All |
@@ -1649,6 +1681,7 @@ src/
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.10" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
     <PackageReference Include="RabbitMQ.Client" Version="7.2.1" />
   </ItemGroup>

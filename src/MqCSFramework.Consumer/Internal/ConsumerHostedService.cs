@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using MqCSFramework.Internal;
 
 namespace MqCSFramework.Consumer.Internal;
 
@@ -40,6 +41,8 @@ internal sealed class ConsumerHostedService : BackgroundService
 
         foreach (var reg in _registrations)
         {
+            ConfigurationChecks.LogUnknownKeys(_logger, reg.UnknownKeys);
+
             var consumer = new MqConsumer(reg.Options, _scopeFactory, _loggerFactory.CreateLogger<MqConsumer>());
             _consumers.Add(consumer);
 
@@ -58,4 +61,5 @@ internal sealed class ConsumerHostedService : BackgroundService
     }
 }
 
-internal sealed record ConsumerRegistration(string Name, ConsumerOptions Options);
+/// <param name="UnknownKeys">Configuration paths that matched no setting; logged as warnings when the consumer starts.</param>
+internal sealed record ConsumerRegistration(string Name, ConsumerOptions Options, IReadOnlyList<string> UnknownKeys);
