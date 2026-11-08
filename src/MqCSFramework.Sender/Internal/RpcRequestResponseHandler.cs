@@ -76,7 +76,9 @@ internal sealed class RpcRequestResponseHandler : IDisposable
         try
         {
             var channel = await _connection.GetChannelAsync(ct);
-            await channel.BasicPublishAsync(exchange, routingKey, false, props, body, ct);
+            // With ConfirmPublish this also waits for the broker's ack; a returned (no queue matched)
+            // or rejected request throws PublishException, which the sender does not retry.
+            await channel.BasicPublishAsync(exchange, routingKey, _connection.ConfirmPublish, props, body, ct);
 
             return await tcs.Task;
         }

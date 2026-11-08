@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 
 namespace MqCSFramework.Consumer.Internal;
 
@@ -195,7 +196,17 @@ internal sealed class MqConsumer : IAsyncDisposable
                 ContentType = "application/json"
             };
 
-            await _channel!.BasicPublishAsync("", replyTo, false, replyProps, responseBytes);
+            try
+            {
+                await _channel!.BasicPublishAsync("", replyTo, _connection!.ConfirmPublish, replyProps, responseBytes);
+            }
+            catch (PublishException ex)
+            {
+                // Only with ConfirmPublish, e.g. the reply queue is gone because the sender stopped. The request
+                // was processed, so don't hand it to the retry path: that would process it again.
+                _logger.LogWarning(ex, "Reply to {ReplyTo} for message {MessageId} was not accepted by the broker. ACK anyway.",
+                    replyTo, context.MessageId);
+            }
         }
 
         await _channel!.BasicAckAsync(ea.DeliveryTag, multiple: false);
@@ -223,10 +234,12 @@ internal sealed class MqConsumer : IAsyncDisposable
                 Headers = headers
             };
 
+            // With ConfirmPublish a returned or rejected copy throws PublishException before the ACK below,
+            // so the caller's fallback NACKs the original instead of acknowledging a lost copy.
             await _channel!.BasicPublishAsync(
                 ea.Exchange ?? "",
                 ea.RoutingKey,
-                false, retryProps, ea.Body, CancellationToken.None);
+                _connection!.ConfirmPublish, retryProps, ea.Body, CancellationToken.None);
 
             await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
 
@@ -253,7 +266,7 @@ internal sealed class MqConsumer : IAsyncDisposable
             await _channel!.BasicPublishAsync(
                 _options.DeadLetterExchange,
                 _options.DeadLetterRoutingKey ?? "",
-                false, dlProps, ea.Body, CancellationToken.None);
+                _connection!.ConfirmPublish, dlProps, ea.Body, CancellationToken.None);
 
             await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
             return;

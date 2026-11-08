@@ -9,6 +9,8 @@ namespace MqCSFramework.Internal;
 /// </summary>
 internal sealed class RabbitMqConnection : IAsyncDisposable
 {
+    private const int MaxOutstandingConfirms = 128;
+
     private readonly RabbitMqConnectionOptions _options;
     private readonly ILogger _logger;
     private readonly SemaphoreSlim _lock = new(1, 1);
@@ -21,6 +23,12 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
         _options = options;
         _logger = logger;
     }
+
+    /// <summary>
+    /// Whether the channel uses publisher confirms. Every publisher passes this as the <c>mandatory</c> flag:
+    /// the client only turns a returned (unroutable) message into an exception when confirms are tracked.
+    /// </summary>
+    public bool ConfirmPublish => _options.ConfirmPublish;
 
     public async Task<IChannel> GetChannelAsync(CancellationToken ct = default)
     {
@@ -57,7 +65,7 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
                 _connection = await CreateConnectionAsync(ct);
             }
 
-            _channel = await _connection.CreateChannelAsync(cancellationToken: ct);
+            _channel = await _connection.CreateChannelAsync(BuildChannelOptions(), ct);
             AttachChannelLogging(_channel);
             return _channel;
         }
@@ -152,6 +160,26 @@ internal sealed class RabbitMqConnection : IAsyncDisposable
     }
 
     private string ClientName => _options.ClientProvidedName ?? "unnamed";
+
+    /// <summary>
+    /// Channel options for <see cref="RabbitMqConnectionOptions.ConfirmPublish"/>, or null for a plain channel.
+    /// Built per channel so each channel gets its own rate limiter.
+    /// </summary>
+    private CreateChannelOptions? BuildChannelOptions()
+    {
+        if (!_options.ConfirmPublish)
+        {
+            return null;
+        }
+
+        // consumerDispatchConcurrency is passed explicitly: the constructor otherwise defaults it to 1,
+        // which would override the connection-level ConsumerDispatchConcurrency.
+        return new CreateChannelOptions(
+            publisherConfirmationsEnabled: true,
+            publisherConfirmationTrackingEnabled: true,
+            outstandingPublisherConfirmationsRateLimiter: new ThrottlingRateLimiter(MaxOutstandingConfirms),
+            consumerDispatchConcurrency: _options.ConsumerDispatchConcurrency);
+    }
 
     /// <summary>
     /// Logs connection lifecycle events so a dropped or recovered connection is visible.

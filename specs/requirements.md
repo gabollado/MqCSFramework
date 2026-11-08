@@ -34,6 +34,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 5. Messages include metadata: message ID (GUID), timestamp, correlation ID
 6. The message is serialized and published to the configured exchange/routing key
 7. Each send is bounded by the sender's timeout (`TimeoutMs`, default 20 seconds; 0 or less disables it), applied together with the caller's cancellation token. When the timeout expires the send fails with a timeout error; a caller's cancellation still surfaces as a cancellation
+8. With publisher confirms on (`ConfirmPublish`, a connection setting, default false), `SendAsync` completes only after the broker confirms the message. A message that no queue matches is returned by the broker and fails with `PublishReturnException`; a message the broker rejects fails with `PublishException` (its base type). Neither resets the channel. With confirms off, `SendAsync` completes once the message is written to the socket, and an unroutable or rejected message is lost without any error. The documentation recommends turning confirms on for standard senders, since a standard send has no other feedback
 
 ### Requirement 2: RPC Messaging (Request-Reply)
 
@@ -51,9 +52,10 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 8. Timeout produces `RpcTimeoutException` (a client-side concern — the sender gave up waiting)
 9. Every RPC response type MUST extend the abstract `RpcResponse` base, which carries the operation outcome: an optional `RpcError` (`Code` + `Message`) and a derived `Success` (true when `Error` is null). The processor expresses business success or failure by setting `Error` on the response it returns — it does not throw for business outcomes
 10. Unexpected exceptions thrown by an RPC processor are NOT sent back to the sender. They follow the same failure path as standard messages (NACK, retry, dead-letter per Requirement 9). The sender observes only a timeout in this case
-11. The RPC sender supports bounded automatic retry on *exceptional* failures, configured via `MaxExceptionRetries` (default 0 = no retry) and `ExceptionRetryDelay` (default 1 second), settable on `RpcSenderOptions` and overridable per call via `RpcOptions`. An "exceptional failure" is a transport/infrastructure problem or a failure to obtain a usable response: a timeout (`RpcTimeoutException`), a broker/connection/publish error, or a failure to deserialize the response. On such a failure the sender waits `ExceptionRetryDelay` and resends, up to `MaxExceptionRetries` additional attempts; if all attempts are exhausted the last exception is thrown. The caller's `CancellationToken` is honored across attempts and during the delay
+11. The RPC sender supports bounded automatic retry on *exceptional* failures, configured via `MaxExceptionRetries` (default 0 = no retry) and `ExceptionRetryDelay` (default 1 second), settable on `RpcSenderOptions` and overridable per call via `RpcOptions`. An "exceptional failure" is a transport/infrastructure problem or a failure to obtain a usable response: a timeout (`RpcTimeoutException`), a broker/connection/publish error other than a `PublishException` (see 14), or a failure to deserialize the response. On such a failure the sender waits `ExceptionRetryDelay` and resends, up to `MaxExceptionRetries` additional attempts; if all attempts are exhausted the last exception is thrown. The caller's `CancellationToken` is honored across attempts and during the delay
 12. A business failure (a `TResponse` returned with `Error` set / `Success` false) is NOT an exceptional failure and is NEVER retried — it is a normal return value handed straight back to the caller
 13. Because a retry resends the request, RPC exception-retry is only safe for **idempotent** operations: if the original request reached the consumer and was processed but its reply was lost or late, a retry causes the consumer to process the request again. Callers that cannot tolerate double-processing should leave `MaxExceptionRetries` at 0
+14. With publisher confirms on (`ConfirmPublish`), a request the broker returns (no queue matched) or rejects fails at once with `PublishException` instead of ending as `RpcTimeoutException` after the full timeout. It is not retried: no consumer will answer it, and the channel is still healthy. Confirms matter less for RPC than for standard sends, because a lost request already surfaces as a timeout; they only make it fail sooner and with a clearer error
 
 ### Requirement 3: Consumer and Processor Resolution
 
@@ -85,6 +87,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 5. The host setting accepts one or more comma-separated `host` or `host:port` entries (the nodes of one cluster). An entry without a port uses the AMQP default (5672, or 5671 with TLS). The client tries the entries in random order for the initial connection and again when it auto-reconnects
 6. TLS, when enabled, applies to every host. The certificate name checked is a configurable server name, or each host's own name when none is set
 7. Opening a connection is bounded: the whole connect (TCP, TLS and AMQP handshake) is capped at the connection timeout per listed host and then fails with a timeout error, because the RabbitMQ client alone can wait forever when a server accepts TCP but never answers the handshake. A caller's cancellation still surfaces as a cancellation
+8. Publisher confirms (`ConfirmPublish`, default false) are a connection setting, so they apply to every sender and consumer: the channel is opened with publisher confirms and confirm tracking (at most 128 unconfirmed publishes at a time), and every publish — sender messages, RPC requests, and the consumer's RPC replies, retry republishes and dead-letter publishes — is sent with the mandatory flag so an unroutable message comes back as an error instead of being dropped
 
 ### Requirement 5: DI Integration
 
@@ -145,6 +148,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 2. Failed messages are NACK'd
 3. Dead-letter support: messages exceeding a retry limit are routed to an error queue
 4. This path applies to both standard and RPC processors: an unexpected exception from an RPC processor is NACK'd/retried/dead-lettered exactly like a standard message. No error response is published to the reply queue — business failures must instead be returned as an `RpcError` on the response (see Requirement 2)
+5. With publisher confirms on (`ConfirmPublish`), the consumer's own publishes are confirmed too. A retry or dead-letter republish the broker returns or rejects is logged and the original message is NACKed without requeue instead of being acknowledged (with confirms off, such a republish is lost and the original is still acknowledged). An RPC reply that cannot be delivered (the reply queue is gone, e.g. the sender stopped) is logged as a warning and the request is still acknowledged, so it is not processed again
 
 ## Non-Functional Requirements
 

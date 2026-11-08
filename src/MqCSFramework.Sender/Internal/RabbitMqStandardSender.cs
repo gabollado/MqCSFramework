@@ -2,6 +2,7 @@ using MqCSFramework.Internal;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Exceptions;
 
 namespace MqCSFramework.Sender.Internal;
 
@@ -72,7 +73,15 @@ internal sealed class RabbitMqStandardSender : IStandardSender
         try
         {
             var channel = await _connection.GetChannelAsync(timeoutCts.Token);
-            await channel.BasicPublishAsync(_options.Exchange, routingKey, false, props, body, timeoutCts.Token);
+            await channel.BasicPublishAsync(_options.Exchange, routingKey, _connection.ConfirmPublish, props, body, timeoutCts.Token);
+        }
+        catch (PublishException ex)
+        {
+            // Only with ConfirmPublish: the broker returned the message (no queue matched) or rejected it.
+            // The channel is still healthy, so don't reset it.
+            _logger.LogError(ex, "Broker did not accept standard message {MessageId} for {Exchange}/{RoutingKey}",
+                messageId, _options.Exchange, routingKey);
+            throw;
         }
         catch (Exception ex) when (ex is not MessageSerializationException)
         {

@@ -31,6 +31,26 @@ public sealed class RabbitMqConnectionOptions
     public string? ClientProvidedName { get; set; }
 
     /// <summary>
+    /// Publisher confirms for every publish made through this connection (sender messages, RPC requests,
+    /// and the consumer's RPC replies, retry republishes and dead-letter publishes). Default false.
+    /// <para>
+    /// False: a publish completes once it is written to the socket. A message that no queue matches is
+    /// dropped by the broker and a broker rejection goes unnoticed, so <c>SendAsync</c> still succeeds.
+    /// </para>
+    /// <para>
+    /// True: the channel uses publisher confirms and publishes are mandatory, so a publish completes only
+    /// after the broker accepts it. No queue matched throws <c>PublishReturnException</c>; a broker
+    /// rejection throws <c>PublishException</c>. Each publish then waits for the broker's ack (up to a few
+    /// hundred milliseconds for persistent messages on durable or quorum queues under load).
+    /// </para>
+    /// <para>
+    /// Recommended true for standard senders, which get no other feedback. Less important for RPC senders,
+    /// where a lost request already ends as <see cref="RpcTimeoutException"/>; with true it fails at once instead.
+    /// </para>
+    /// </summary>
+    public bool ConfirmPublish { get; set; }
+
+    /// <summary>
     /// AMQP heartbeat timeout. The client sends heartbeat frames roughly every
     /// (timeout / 2) seconds, which also keeps otherwise-idle connections alive
     /// against proxies and load balancers that drop idle TCP connections.

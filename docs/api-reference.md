@@ -84,6 +84,10 @@ public interface IStandardSender
 
 **Throws:**
 - `TimeoutException` — the send (connect if needed + publish) didn't finish within `StandardSenderOptions.TimeoutMs`, or the connection couldn't be opened within `RequestedConnectionTimeout` per host
+- `PublishReturnException` (`RabbitMQ.Client.Exceptions`) — only with `Connection.ConfirmPublish = true`: no queue matched the exchange/routing key
+- `PublishException` (`RabbitMQ.Client.Exceptions`) — only with `Connection.ConfirmPublish = true`: the broker rejected the message
+
+With the default `ConfirmPublish = false`, neither of the last two is ever thrown: an unroutable or rejected message is lost silently and `SendAsync` still returns its ID. Turning `ConfirmPublish` on is recommended for standard senders — see [Publisher confirms](configuration.md#publisher-confirms-confirmpublish).
 
 **Generic constraints** enforce compile-time safety — you cannot send a message type that doesn't match the processor's expectation.
 
@@ -109,6 +113,7 @@ public interface IRpcSender
 **Throws:**
 - `RpcTimeoutException` — if no response within the configured timeout
 - `TimeoutException` — if the connection couldn't be opened within `RequestedConnectionTimeout` per host
+- `PublishException` / `PublishReturnException` (`RabbitMQ.Client.Exceptions`) — only with `Connection.ConfirmPublish = true`: the broker rejected the request or no queue matched. Thrown at once and not retried; without `ConfirmPublish` the same request ends as `RpcTimeoutException`
 - `RpcRemoteException` — if the processor threw an exception
 
 ---

@@ -2,6 +2,7 @@ using MqCSFramework.Internal;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Exceptions;
 
 namespace MqCSFramework.Sender.Internal;
 
@@ -53,7 +54,9 @@ internal sealed class RabbitMqRpcSender : IRpcSender, IAsyncDisposable
                 return await SendAttemptAsync<TProcessor, TResponse, TRequest>(
                     body, correlationId, routingKey, timeout, options, attempt, ct);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException && attempt <= maxExceptionRetries)
+            // A PublishException (only with ConfirmPublish) means the broker returned or rejected the request:
+            // no consumer will answer it, so retrying can't help.
+            catch (Exception ex) when (ex is not (OperationCanceledException or PublishException) && attempt <= maxExceptionRetries)
             {
                 _logger.LogWarning(ex,
                     "RPC request for processor {Processor} failed on attempt {Attempt} of {Total}. Retrying in {Delay}ms.",

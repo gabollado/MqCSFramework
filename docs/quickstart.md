@@ -110,7 +110,8 @@ Console.WriteLine($"Available: {response.Available}");
           "HostName": "localhost",
           "UserName": "guest",
           "Password": "guest",
-          "VirtualHost": "/"
+          "VirtualHost": "/",
+          "ConfirmPublish": true
         },
         "Exchange": "",
         "RoutingKey": "orders-queue"
@@ -154,6 +155,8 @@ Console.WriteLine($"Available: {response.Available}");
   }
 }
 ```
+
+`"ConfirmPublish": true` on the standard sender makes `SendAsync` wait until the broker has accepted the message, and throw if no queue matched or the broker rejected it. Without it (the default), such a message is lost silently. Keep it on for standard senders; for RPC senders it is optional, because a lost request already ends as `RpcTimeoutException`. See [Publisher confirms](configuration.md#publisher-confirms-confirmpublish).
 
 ## Running the Included Samples
 

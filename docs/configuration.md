@@ -86,6 +86,7 @@ Embedded in each sender/consumer. Every endpoint has its own independent connect
 | `SslServerName` | string? | `null` | Certificate name checked for every host. When empty, each host is checked against its own name |
 | `ClientProvidedName` | string? | `null` | Connection name visible in RabbitMQ management UI |
 | `RequestedConnectionTimeout` | TimeSpan | `00:00:30` | Budget per host for opening a connection (TCP, TLS, AMQP handshake). The whole connect fails with `TimeoutException` after this times the number of hosts |
+| `ConfirmPublish` | bool | `false` | Wait for the broker to accept every publish and fail when it doesn't. **Set it to `true` for standard senders**; optional for RPC senders. See [Publisher confirms](#publisher-confirms-confirmpublish) |
 
 There is no separate `Port` setting: put a non-default port in `HostName` (`"rabbit.example.com:5673"`).
 
@@ -113,6 +114,58 @@ There is no separate `Port` setting: put a non-default port in `HostName` (`"rab
 
 ---
 
+## Publisher confirms (`ConfirmPublish`)
+
+> **Recommendation:** set `"ConfirmPublish": true` on the `Connection` of every **standard sender**. With the default `false`, `SendAsync` can succeed for a message that the broker never stored. For **RPC senders** it is optional.
+
+`ConfirmPublish` lives on `Connection`, so it applies to everything that publishes through that connection: standard senders, RPC senders, and consumers (their RPC replies, retry republishes and dead-letter publishes). The default is `false`.
+
+| | `false` (default) | `true` |
+|---|---|---|
+| `SendAsync` completes when | the message is written to the network socket | the broker has accepted the message |
+| No queue matches the exchange/routing key (typo, queue not declared yet, missing binding) | message silently dropped, `SendAsync` still succeeds | throws `PublishReturnException` |
+| The broker rejects the message (e.g. a queue length limit with `overflow: reject-publish`) | message lost, `SendAsync` still succeeds | throws `PublishException` |
+| Cost per publish | none | waits for the broker's ack: about a millisecond locally, up to a few hundred milliseconds for persistent messages on durable or quorum queues under load |
+
+### Which side needs it
+
+- **Standard senders — turn it on.** A fire-and-forget send has no other way to find out the message was lost.
+- **RPC senders — optional.** A request that never reaches a queue already ends as `RpcTimeoutException`, because no reply comes back. With `true` it fails at once with `PublishException` instead of after the full timeout, and it is not retried (no consumer could answer it).
+- **Consumers — recommended when you use retries or a dead-letter exchange.** With `false`, a retry or dead-letter copy that the broker drops is lost, and the original message is still acknowledged. With `true`, the failure is logged and the original is NACKed instead. An RPC reply that can't be delivered (the sender is gone) is only logged; the request is not processed again.
+
+### Handling the exceptions
+
+`PublishReturnException` derives from `PublishException`; both are in `RabbitMQ.Client.Exceptions` and carry details of what the broker said (`PublishReturnException` has the exchange, routing key and reply code). The connection and channel stay open, so after fixing the routing you can simply send again.
+
+```csharp
+try
+{
+    await sender.SendAsync<IOrderProcessor, OrderMessage>(order, correlationId);
+}
+catch (PublishReturnException ex)
+{
+    // No queue matched: check the exchange, routing key and bindings (ex.Message has the details)
+}
+catch (PublishException)
+{
+    // The broker rejected the message
+}
+```
+
+### Example
+
+```json
+"Senders": {
+  "orders": {
+    "Connection": { "HostName": "localhost", "ConfirmPublish": true },
+    "Exchange": "",
+    "RoutingKey": "orders-queue"
+  }
+}
+```
+
+---
+
 ## StandardSenderOptions
 
 Configuration for a fire-and-forget sender.
@@ -124,12 +177,14 @@ Configuration for a fire-and-forget sender.
 | `RoutingKey` | string | `""` | Default routing key (queue name for default exchange) |
 | `TimeoutMs` | int | `20000` | Upper bound for one send (connect if needed + publish), together with the caller's token. On expiry `SendAsync` throws `TimeoutException`. `0` disables it |
 
+Set `Connection.ConfirmPublish` to `true` for standard senders, otherwise a message that can't be routed or is rejected is lost without an error (see [Publisher confirms](#publisher-confirms-confirmpublish)).
+
 ### Example
 
 ```json
 "Senders": {
   "orders": {
-    "Connection": { "HostName": "localhost" },
+    "Connection": { "HostName": "localhost", "ConfirmPublish": true },
     "Exchange": "",
     "RoutingKey": "orders-queue"
   }
@@ -140,7 +195,7 @@ Configuration for a fire-and-forget sender.
 
 ## RpcSenderOptions
 
-Configuration for a request-reply sender.
+Configuration for a request-reply sender. `Connection.ConfirmPublish` is optional here: a lost request already ends as `RpcTimeoutException`; with `true` it fails at once with `PublishException` instead (see [Publisher confirms](#publisher-confirms-confirmpublish)).
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -166,7 +221,7 @@ Configuration for a request-reply sender.
 
 ## ConsumerOptions
 
-Configuration for a message consumer.
+Configuration for a message consumer. If you use retries or a dead-letter exchange, set `Connection.ConfirmPublish` to `true` so a copy the broker doesn't accept is never acknowledged away (see [Publisher confirms](#publisher-confirms-confirmpublish)).
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|

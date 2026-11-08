@@ -37,7 +37,7 @@ The implementation language is C# 14 / .NET 10.
     - _Requirements: 1.1, 1.2, 2.1, 2.2_
 
   - [ ] 2.3 Create configuration options classes
-    - Create `RabbitMqConnectionOptions` (HostName [comma-separated `host` or `host:port`, no separate port property], UserName, Password, VirtualHost, UseSsl, SslServerName, ClientProvidedName, RequestedConnectionTimeout [default 30s, connect budget per host])
+    - Create `RabbitMqConnectionOptions` (HostName [comma-separated `host` or `host:port`, no separate port property], UserName, Password, VirtualHost, UseSsl, SslServerName, ClientProvidedName, RequestedConnectionTimeout [default 30s, connect budget per host], ConfirmPublish [default false, publisher confirms + mandatory for every publish on the connection])
     - Create `StandardSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 20000, <= 0 disables])
     - Create `RpcSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 30000], MaxExceptionRetries [default 0], ExceptionRetryDelayMs [int ms, default 1000])
     - Create `ConsumerOptions` (Connection, QueueName, PrefetchCount, MaxRetries, DeadLetterExchange, DeadLetterRoutingKey, SuppressMessageBodyLogging, MaskedFields)
@@ -59,8 +59,9 @@ The implementation language is C# 14 / .NET 10.
     - Parse `HostName` with `AmqpTcpEndpoint.ParseMultiple`, give each endpoint its own SSL option (enabled = `UseSsl`, server name = `SslServerName` when set, otherwise the endpoint's host), and connect with the endpoint list
     - Cap the connect at `RequestedConnectionTimeout` x number of endpoints with a token linked to the caller's; when the cap (not the caller) cancels it, throw `TimeoutException`
     - Log the endpoint connected to, and attach lifecycle logging: connection `ConnectionShutdownAsync`, `RecoverySucceededAsync`, `ConnectionRecoveryErrorAsync`, `CallbackExceptionAsync`; channel `ChannelShutdownAsync`, `CallbackExceptionAsync`. Application-initiated shutdowns at Information, other shutdowns at Warning, errors at Error. Remember the current endpoint (updated on recovery) instead of reading `IConnection.Endpoint` in a shutdown handler
+    - When `ConfirmPublish` is true, create each channel with a new `CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true, new ThrottlingRateLimiter(128), consumerDispatchConcurrency: options.ConsumerDispatchConcurrency)`; expose `ConfirmPublish` so every publisher passes it as `mandatory`
     - Implement `IAsyncDisposable` for graceful channel and connection close
-    - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6, 4.7, 8.7_
+    - _Requirements: 4.1, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 8.7_
 
 - [ ] 4. Implement standard sender
   - [ ] 4.1 Create RabbitMqStandardSender internal class implementing IStandardSender
@@ -70,9 +71,10 @@ The implementation language is C# 14 / .NET 10.
     - Merge `SendOptions.AdditionalHeaders` if provided
     - Publish via `channel.BasicPublishAsync` to configured exchange/routing key
     - Bound getting the channel and publishing with `TimeoutMs` through a token linked to the caller's; on that timeout reset the channel and throw `TimeoutException`
+    - Publish with `mandatory = connection.ConfirmPublish`; on `PublishException` log and re-throw without resetting the channel
     - Return the generated MessageId
     - Log the send operation with correlation ID
-    - _Requirements: 1.3, 1.4, 1.5, 1.6, 1.7, 7.1, 8.1, 8.2_
+    - _Requirements: 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 7.1, 8.1, 8.2_
 
   - [ ]* 4.2 Write property test for message envelope correctness (standard sender)
     - **Property 1: Message Envelope Correctness**
@@ -94,7 +96,8 @@ The implementation language is C# 14 / .NET 10.
     - Deserialize the reply bytes directly into `TResponse` (no envelope); return it. Business failure is read from `TResponse.Error`, not thrown
     - Exception-retry loop: on an exceptional failure (timeout, transport/broker error, or response-deserialization failure) wait `ExceptionRetryDelayMs` and resend, up to `MaxExceptionRetries` additional attempts (fresh messageId per attempt, caller correlationId reused); honor the caller's CancellationToken across attempts and the delay; throw the last exception when exhausted. Never retry a business `Success = false` response; never retry request-serialization failure
     - Implement `HandleReply` method called by the reply consumer; match the reply to a pending call by the reply's `MessageId`
-    - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.11, 2.12, 2.13_
+    - Publish requests with `mandatory = connection.ConfirmPublish`; exclude `PublishException` from the exception-retry filter so a returned or rejected request fails at once
+    - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.11, 2.12, 2.13, 2.14_
 
   - [ ]* 5.2 Write property test for RPC round-trip matching
     - **Property 4: RPC Round-Trip Matching**
@@ -123,8 +126,9 @@ The implementation language is C# 14 / .NET 10.
     - For RPC pattern: call ProcessAsync to get serialized `TResponse` bytes, publish them directly to the ReplyTo queue echoing the request's `MessageId` (the sender's match key) and `CorrelationId` on the reply, then ACK. Do NOT catch processor exceptions here — let them propagate to the shared failure path (retry/dead-letter); no reply is sent on an unexpected exception
     - Handle missing headers (NACK without requeue), unresolvable types (NACK without requeue), deserialization failures (NACK without requeue)
     - Track retry count via `mq-retry-count` header; dead-letter when count >= MaxRetries
+    - Publish RPC replies, retry republishes and dead-letter publishes with `mandatory = connection.ConfirmPublish`; a `PublishException` on the RPC reply is logged as a warning and the request is still ACKed; on a republish it falls through to the NACK-without-requeue fallback
     - Implement `IAsyncDisposable` for graceful channel/connection close
-    - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3_
+    - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3, 9.5_
 
   - [ ]* 7.3 Write property test for consumer dispatch correctness
     - **Property 3: Consumer Dispatch Correctness**

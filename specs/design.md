@@ -128,7 +128,7 @@ graph TB
 3. Framework generates a `MessageId` as a new GUID in "N" format (32 hex digits, no hyphens)
 4. Framework sets headers: `mq-processor-type` = the processor type's assembly-qualified name, `mq-pattern` = `"standard"`
 5. Framework publishes to configured exchange/routing key via the channel's async publish method
-6. On publish failure: logs error, resets channel, re-throws
+6. On publish failure: logs error, resets channel, re-throws (a `PublishException` from a broker return or nack, only possible with `ConfirmPublish`, is re-thrown without resetting the channel)
 7. Returns the generated `MessageId`
 
 Consumer side:
@@ -279,6 +279,9 @@ Properties:
   - RequestedConnectionTimeout: duration (default 30 seconds) - budget per host for opening a
       connection (TCP connect, TLS, AMQP handshake); the whole connect is capped at this value
       times the number of hosts
+  - ConfirmPublish: boolean (default false) - publisher confirms for every publish made through this
+      connection (see Key Behaviors > Publisher Confirms). Recommended true for standard senders;
+      less important for RPC senders, where a lost request already ends as a timeout
 ```
 
 #### Exceptions
@@ -356,7 +359,16 @@ Behavior:
   Returns existing open channel if available.
   Otherwise: closes stale channel, ensures connection is alive, creates new channel and attaches
   channel lifecycle logging to it.
+  When options.ConfirmPublish is true the channel is created with channel options: publisher
+  confirmations on, confirmation tracking on, outstanding-confirms rate limiter = a new
+  ThrottlingRateLimiter(128) per channel, and consumerDispatchConcurrency = options.ConsumerDispatchConcurrency.
+  The last one is passed explicitly because the channel-options constructor otherwise defaults it to 1,
+  which would override the connection-level setting. When false, the channel is created without options.
   Thread-safe via semaphore (mutual exclusion lock).
+
+Property: ConfirmPublish (boolean, read-only)
+  Returns options.ConfirmPublish. Every publisher (standard sender, RPC request handler, consumer)
+  passes it as the mandatory flag, so the flag and the channel's confirm mode always agree.
 
 Method: ResetChannelAsync
 Parameters: none
@@ -589,15 +601,19 @@ SendAsync behavior:
        - "mq-pattern" = "standard"
   5. Merge any AdditionalHeaders from options into the headers
   6. Link the caller's cancellation token with options.TimeoutMs (when > 0); get channel from
-     connection and publish message asynchronously, both with the linked token
-  7. On publish failure (any exception except MessageSerializationException):
+     connection and publish message asynchronously (mandatory = connection.ConfirmPublish), both with
+     the linked token. With confirms on, the publish completes only after the broker's ack
+  7. On PublishException (broker returned or rejected the message; only with confirms on):
+     - Log error with messageId, exchange, routingKey
+     - Re-throw WITHOUT resetting the channel (it is still healthy)
+  8. On any other publish failure (any exception except MessageSerializationException):
      - Log error with messageId, exchange, routingKey
      - Call connection.ResetChannelAsync()
      - If the failure is a cancellation caused by TimeoutMs (not by the caller's token):
        throw TimeoutException wrapping it
      - Otherwise re-throw the exception
-  8. Log info: published standard message with messageId, processor name, exchange, routingKey
-  9. Return messageId
+  9. Log info: published standard message with messageId, processor name, exchange, routingKey
+  10. Return messageId
 ```
 
 #### RabbitMqRpcSender (Internal)
@@ -656,7 +672,7 @@ SendAsync behavior:
          // Caught (and retried) ONLY when the failure is exceptional AND retries remain. On the last
          // attempt, a caller cancellation, or a non-exceptional failure, the exception is NOT caught
          // and propagates to the caller.
-         catch (Exception ex) when (ex is not OperationCanceledException && attempt < maxExceptionRetries)
+         catch (Exception ex) when (ex is not (OperationCanceledException or PublishException) && attempt < maxExceptionRetries)
          {
              log warning (attempt+1 of maxExceptionRetries+1, delayMs);
              await Task.Delay(exceptionRetryDelayMs, ct);   // honors ct; throws on caller cancel
@@ -677,12 +693,16 @@ SendAsync behavior:
        `await Task.Delay(exceptionRetryDelay, ct)` already throws OperationCanceledException if the caller
        cancels (now or during the wait), abandoning the retry. Rely on that.
 
-  Retry predicate (`ex is not OperationCanceledException`, inlined directly in the catch `when` filter —
-  do NOT extract it into a helper method): EVERYTHING is retryable EXCEPT a caller-driven cancellation.
+  Retry predicate (`ex is not (OperationCanceledException or PublishException)`, inlined directly in the
+  catch `when` filter — do NOT extract it into a helper method): EVERYTHING is retryable EXCEPT a
+  caller-driven cancellation and a PublishException.
   A timeout surfaces as RpcTimeoutException (retried); a caller cancelling their CancellationToken
   surfaces as OperationCanceledException (NOT retried, because the caller explicitly asked to stop —
   retrying would ignore their intent). These are produced as two distinct exceptions by
   RpcRequestResponseHandler on purpose (see its PublishAndAwaitReplyAsync).
+  A PublishException (only with ConfirmPublish: the broker returned the request because no queue
+  matched, or rejected it) is NOT retried: no consumer will answer that request and the channel is
+  healthy, so the caller gets it at once instead of an RpcTimeoutException after the full timeout.
 
 Note on match key, retry correlation, and idempotency:
   Each attempt uses a fresh messageId as the pending-map key, so a late reply to a prior (already
@@ -736,7 +756,8 @@ Behavior:
      caused the cancellation — complete the pending task as canceled (OperationCanceledException); otherwise
      (the timeout fired) set RpcTimeoutException. This lets callers and the sender's exception-retry logic
      distinguish a caller cancellation (not retryable) from a timeout (retryable)
-  6. Get channel from connection, publish the message
+  6. Get channel from connection, publish the message (mandatory = connection.ConfirmPublish; with
+     confirms on, the publish awaits the broker's ack and a return or nack throws PublishException)
   7. Await the completion source's result
   8. On failure before completion: remove pending entry (by messageId), re-throw
 
@@ -1002,7 +1023,11 @@ Behavior:
   4. If ReplyTo is not empty:
      - Create reply properties: MessageId=original request's MessageId (the match key the sender awaits),
        CorrelationId=original request's CorrelationId (trace continuity), ContentType="application/json"
-     - Publish the serialized TResponse bytes directly to exchange="" (default), routingKey=ReplyTo
+     - Publish the serialized TResponse bytes directly to exchange="" (default), routingKey=ReplyTo,
+       mandatory = connection.ConfirmPublish
+     - On PublishException (only with confirms on; e.g. the reply queue is gone because the sender
+       stopped): log a warning and continue. Do NOT let it reach HandleFailureAsync: the request was
+       processed, and retrying it would process it again for a caller that is no longer waiting
   5. ACK the original message
 
 Note: business failures are NOT exceptions. The processor returns a TResponse with its Error
@@ -1055,6 +1080,12 @@ Behavior:
      - ACK the original message
      - Return
   4. Otherwise: NACK without requeue
+
+  Both republishes use mandatory = connection.ConfirmPublish. With confirms on, a republish the broker
+  returns or rejects throws PublishException BEFORE the ACK; it propagates to DispatchMessageCoreAsync's
+  fallback, which logs it and NACKs the original without requeue. So the original is never acknowledged
+  for a copy the broker did not accept. With confirms off, such a copy is lost and the original is
+  still acknowledged.
 ```
 
 **Body logging:**
@@ -1287,7 +1318,8 @@ rpcSender = services.GetRequiredKeyedService<IRpcSender>("stock")
           "Password": "guest",
           "VirtualHost": "/",
           "UseSsl": false,
-          "ClientProvidedName": "sender-orders"
+          "ClientProvidedName": "sender-orders",
+          "ConfirmPublish": true
         },
         "Exchange": "",
         "RoutingKey": "orders-queue",
@@ -1366,9 +1398,23 @@ Each `RabbitMqConnection` creates a connection factory with:
 
 The RabbitMQ client library handles reconnection internally. The framework relies on this rather than implementing custom reconnect logic. When `HostName` lists several hosts, recovery reconnects to any of them.
 
+### Publisher Confirms (ConfirmPublish)
+
+`RabbitMqConnectionOptions.ConfirmPublish` (default false) applies to every publish made through that connection: standard sends, RPC requests, and the consumer's RPC replies, retry republishes and dead-letter publishes.
+
+- **Off (default):** the channel has no confirms and publishes use `mandatory = false`. A publish completes once it is written to the socket. A message that no queue matches is silently dropped by the broker, and a broker rejection goes unnoticed: `SendAsync` still returns a MessageId.
+- **On:** the channel is created with publisher confirmations and confirmation tracking, and publishes use `mandatory = true`. A publish completes only after the broker's ack. For persistent messages on durable or quorum queues that ack waits for the disk write or replication, so each publish can take from about a millisecond up to a few hundred milliseconds under load. Failures surface from the publish itself:
+  - no queue matched → `PublishReturnException` (a `PublishException` with `IsReturn = true`, the exchange, routing key and reply code 312 NO_ROUTE)
+  - broker rejected (nack) → `PublishException`
+  - channel closed while waiting → `AlreadyClosedException`
+- `mandatory` is tied to `ConfirmPublish` because the RabbitMQ client only turns a returned message into an exception when confirms and tracking are on; without tracking the return arrives after the publish already completed.
+- Guidance (repeated in the user docs): turn it on for **standard senders**, whose `SendAsync` has no other feedback. For **RPC senders** it matters less: a lost request already ends as `RpcTimeoutException`; confirms only make it fail sooner and with a clearer error. For **consumers** it protects retry and dead-letter republishes.
+
 ### Channel Reset on Failure
 
-When the standard sender encounters a publish failure (exception other than `MessageSerializationException`):
+A `PublishException` (broker return or nack, only with `ConfirmPublish`) does NOT reset the channel: the channel is healthy and the exception is re-thrown as is.
+
+When the standard sender encounters any other publish failure (exception other than `MessageSerializationException`):
 1. Logs the error
 2. Calls `connection.ResetChannelAsync()` to close and null the channel
 3. Re-throws the exception (a cancellation caused by the send timeout is thrown as `TimeoutException`)
