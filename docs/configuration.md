@@ -229,6 +229,8 @@ Configuration for a request-reply sender. `Connection.ConfirmPublish` is optiona
 
 Configuration for a message consumer. If you use retries or a dead-letter exchange, set `Connection.ConfirmPublish` to `true` so a copy the broker doesn't accept is never acknowledged away (see [Publisher confirms](#publisher-confirms-confirmpublish)).
 
+If a consumer can't start (for example its broker is down, or the connect times out), the error is logged and the start is retried every 10 seconds until it works or the application stops. The application keeps running, and the other consumers start independently.
+
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `Connection` | RabbitMqConnectionOptions | (see above) | Connection settings for this consumer |

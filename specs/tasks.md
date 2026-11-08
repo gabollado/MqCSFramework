@@ -173,9 +173,10 @@ The implementation language is C# 14 / .NET 10.
   - [ ] 9.2 Create ConsumerHostedService internal class extending BackgroundService
     - Accept consumer registrations, `IServiceProvider`, and `ILoggerFactory` via constructor
     - In `ExecuteAsync`: create `MqConsumer` instances for each registration, start them all in parallel
+    - Retry a consumer that fails to start: log the error, dispose that attempt, wait 10 seconds and start a fresh `MqConsumer`, until it starts or the host stops; never let the exception escape `ExecuteAsync`
     - On cancellation token trigger: dispose all consumers gracefully
     - Log each registration's unknown configuration keys as warnings before starting its consumer
-    - _Requirements: 5.10, 6.1, 6.2, 6.3_
+    - _Requirements: 5.10, 6.1, 6.2, 6.3, 6.4_
 
   - [ ]* 9.3 Write unit tests for DI registration and builder
     - Test that `AddSender` registers keyed `IStandardSender` resolvable via `GetRequiredKeyedService`

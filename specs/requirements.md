@@ -117,6 +117,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 1. A `BackgroundService` starts and manages all registered consumers
 2. Graceful shutdown via `CancellationToken`
 3. Multiple consumers can run in a single host
+4. A consumer that fails to start (for example its broker is unreachable, or the connect times out) is logged as an error and retried every 10 seconds until it starts or the host stops. The host keeps running instead of stopping. Each consumer starts independently, so one that cannot start does not hold up the others. A failed attempt is disposed and the next attempt starts from a fresh consumer
 
 ### Requirement 7: Serialization
 

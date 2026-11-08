@@ -961,7 +961,8 @@ Fields:
   - scopeFactory: IServiceScopeFactory
   - loggerFactory: logger factory
   - logger: logger instance
-  - consumers: mutable list of MqConsumer
+  - consumers: thread-safe collection of started MqConsumer instances (added concurrently by the start loops)
+  - StartRetryDelay: constant duration, 10 seconds - wait between start attempts
 Constructor parameters:
   - registrations: collection of ConsumerRegistration (injected from DI)
   - scopeFactory: IServiceScopeFactory
@@ -971,15 +972,28 @@ Constructor parameters:
 Execute behavior (runs on background thread):
   1. If no registrations: log warning "No consumers registered", idle indefinitely until cancellation, return
   2. Log info "Starting {Count} consumer(s)"
-  3. For each registration:
-     - ConfigurationChecks.LogUnknownKeys(logger, registration.UnknownKeys)
-     - Create a new MqConsumer with registration.Options, scopeFactory, and a new logger
-     - Add to consumers list
-     - Call consumer.StartAsync(cancellationToken)
-  4. Log info "All consumers started"
+  3. Run StartWithRetryAsync for every registration at the same time and await them all, so a consumer
+     that cannot start does not hold up the others
+  4. If the host is not stopping: log info "All consumers started"
   5. Idle indefinitely until cancellation token fires
   6. Log info "Shutdown requested. Disposing consumers..."
-  7. For each consumer: call DisposeAsync
+  7. For each started consumer: call DisposeAsync
+
+Method: StartWithRetryAsync (private)
+Parameters:
+  - registration: ConsumerRegistration
+  - stoppingToken: cancellation token
+Behavior:
+  ConfigurationChecks.LogUnknownKeys(logger, registration.UnknownKeys)
+  While the host is not stopping:
+    - Create a new MqConsumer with registration.Options, scopeFactory, and a new logger
+    - Call consumer.StartAsync(stoppingToken). On success: add it to consumers and return
+    - On any exception: dispose that consumer (it may hold a half-open connection). If the host is
+      stopping, return. Otherwise log error (with the exception) "Consumer '{Name}' failed to start.
+      Retrying in {Delay}s." and wait StartRetryDelay (the wait ends early on shutdown)
+  An exception never escapes, so it cannot fault ExecuteAsync and stop the host (the default
+  BackgroundServiceExceptionBehavior is StopHost). A connect that times out surfaces as
+  TimeoutException, not a cancellation, so it is retried like any other failure.
 ```
 
 #### MqConsumer (Internal)
