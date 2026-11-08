@@ -194,6 +194,7 @@ internal sealed class MqConsumer : IAsyncDisposable
                 // Echo CorrelationId for trace continuity (not used for matching).
                 CorrelationId = ea.BasicProperties?.CorrelationId,
                 ContentType = "application/json"
+                // Left transient: the reply queue is exclusive and non-durable, so persistence buys nothing.
             };
 
             try
@@ -230,6 +231,7 @@ internal sealed class MqConsumer : IAsyncDisposable
                 CorrelationId = ea.BasicProperties?.CorrelationId,
                 Timestamp = ea.BasicProperties?.Timestamp ?? new AmqpTimestamp(0),
                 ContentType = ea.BasicProperties?.ContentType,
+                Persistent = ea.BasicProperties?.Persistent ?? false,
                 ReplyTo = ea.BasicProperties?.ReplyTo,
                 Headers = headers
             };
@@ -258,6 +260,7 @@ internal sealed class MqConsumer : IAsyncDisposable
                 MessageId = ea.BasicProperties?.MessageId,
                 CorrelationId = ea.BasicProperties?.CorrelationId,
                 ContentType = ea.BasicProperties?.ContentType,
+                Persistent = ea.BasicProperties?.Persistent ?? false,
                 Headers = ea.BasicProperties?.Headers != null
                     ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
                     : new Dictionary<string, object?>()

@@ -596,6 +596,7 @@ SendAsync behavior:
      - CorrelationId = the correlationId parameter
      - Timestamp = current UTC time as Unix epoch seconds
      - ContentType = "application/json"
+     - Persistent = true (delivery mode 2)
      - Headers:
        - "mq-processor-type" = TProcessor's assembly-qualified type name
        - "mq-pattern" = "standard"
@@ -650,6 +651,7 @@ SendAsync behavior:
         - ReplyTo = the reply queue name
         - Timestamp = current UTC time as Unix epoch seconds
         - ContentType = "application/json"
+        - Persistent = true (delivery mode 2)
         - Headers:
           - "mq-processor-type" = TProcessor's assembly-qualified type name
           - "mq-pattern" = "rpc"
@@ -1022,7 +1024,8 @@ Behavior:
   3. Read ReplyTo from message properties
   4. If ReplyTo is not empty:
      - Create reply properties: MessageId=original request's MessageId (the match key the sender awaits),
-       CorrelationId=original request's CorrelationId (trace continuity), ContentType="application/json"
+       CorrelationId=original request's CorrelationId (trace continuity), ContentType="application/json".
+       Not persistent: the reply queue is exclusive and non-durable, so persistence would buy nothing
      - Publish the serialized TResponse bytes directly to exchange="" (default), routingKey=ReplyTo,
        mandatory = connection.ConfirmPublish
      - On PublishException (only with confirms on; e.g. the reply queue is gone because the sender
@@ -1068,14 +1071,14 @@ Behavior:
   2. If retries NOT exhausted (MaxRetries <= 0 OR retryCount < MaxRetries):
      - Copy all headers from original (or create empty dictionary if none)
      - Set "mq-retry-count" = retryCount + 1
-     - Create new properties copying: MessageId, CorrelationId, Timestamp, ContentType, ReplyTo, Headers
+     - Create new properties copying: MessageId, CorrelationId, Timestamp, ContentType, Persistent, ReplyTo, Headers
      - Republish to the same exchange/routing key as the original
      - ACK the original message
      - Log warning: "Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued."
      - Return
   3. If DeadLetterExchange is configured (not null/empty):
      - Log warning: "Message {MessageId} exceeded max retries. Routing to dead-letter."
-     - Create new properties copying: MessageId, CorrelationId, ContentType, Headers from original
+     - Create new properties copying: MessageId, CorrelationId, ContentType, Persistent, Headers from original
      - Publish to DeadLetterExchange with DeadLetterRoutingKey (or "" if null)
      - ACK the original message
      - Return
@@ -1203,6 +1206,9 @@ Messages on the wire have this structure:
 | Property: `Timestamp` | Unix epoch seconds (AMQP timestamp) |
 | Property: `ReplyTo` | Reply queue name (RPC only, format: `{routingKey}.reply.{GUID:N}`) |
 | Property: `ContentType` | `"application/json"` |
+| Property: `DeliveryMode` | `2` (persistent) on standard messages and RPC requests; RPC replies are left transient |
+
+A persistent message in a durable classic queue survives a broker restart; a transient one is discarded when the node restarts, even in a durable queue. Quorum queues store every message on disk regardless of delivery mode.
 
 ### RPC Response Wire Format
 
@@ -1229,7 +1235,7 @@ On business failure (processor set `Error` on the response):
 Retry count is tracked via a custom header `mq-retry-count` (integer). On each failure, the consumer:
 1. Reads the current retry count from the header (0 if not present)
 2. If `retryCount >= MaxRetries`: publishes to dead-letter exchange (if configured) and ACKs, otherwise NACKs without requeue
-3. If under limit: republishes the message to the same exchange/routing key with `mq-retry-count` incremented by 1, preserving all other properties (MessageId, CorrelationId, Timestamp, ContentType, ReplyTo, Headers), then ACKs the original
+3. If under limit: republishes the message to the same exchange/routing key with `mq-retry-count` incremented by 1, preserving all other properties (MessageId, CorrelationId, Timestamp, ContentType, Persistent, ReplyTo, Headers), then ACKs the original. The dead-letter copy also keeps the original's Persistent flag
 
 ### Queue Declaration
 

@@ -67,14 +67,14 @@ The implementation language is C# 14 / .NET 10.
   - [ ] 4.1 Create RabbitMqStandardSender internal class implementing IStandardSender
     - Accept `RabbitMqConnection` and `StandardSenderOptions` via constructor
     - Serialize message to UTF-8 JSON using `System.Text.Json`
-    - Build `BasicProperties` with MessageId (GUID), CorrelationId, Timestamp, ContentType, and headers (`mq-processor-type` = AssemblyQualifiedName of TProcessor, `mq-pattern` = "standard")
+    - Build `BasicProperties` with MessageId (GUID), CorrelationId, Timestamp, ContentType, `Persistent = true`, and headers (`mq-processor-type` = AssemblyQualifiedName of TProcessor, `mq-pattern` = "standard")
     - Merge `SendOptions.AdditionalHeaders` if provided
     - Publish via `channel.BasicPublishAsync` to configured exchange/routing key
     - Bound getting the channel and publishing with `TimeoutMs` through a token linked to the caller's; on that timeout reset the channel and throw `TimeoutException`
     - Publish with `mandatory = connection.ConfirmPublish`; on `PublishException` log and re-throw without resetting the channel
     - Return the generated MessageId
     - Log the send operation with correlation ID
-    - _Requirements: 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 7.1, 8.1, 8.2_
+    - _Requirements: 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 7.1, 8.1, 8.2_
 
   - [ ]* 4.2 Write property test for message envelope correctness (standard sender)
     - **Property 1: Message Envelope Correctness**
@@ -91,13 +91,13 @@ The implementation language is C# 14 / .NET 10.
     - Accept `RabbitMqConnection` and `RpcSenderOptions` via constructor
     - Maintain a `ConcurrentDictionary<string, TaskCompletionSource<byte[]>>` for pending RPC calls, keyed by the per-message `MessageId` (NOT CorrelationId — correlationId is a process-level trace id, not unique per message)
     - Set up a Direct Reply-to consumer on the connection's channel to receive responses
-    - On send: serialize request ONCE before the retry loop, set headers (`mq-processor-type`, `mq-pattern` = "rpc"), set `ReplyTo` = reply queue, publish
+    - On send: serialize request ONCE before the retry loop, set headers (`mq-processor-type`, `mq-pattern` = "rpc"), set `ReplyTo` = reply queue and `Persistent = true`, publish
     - Await response with configurable timeout; throw `RpcTimeoutException` on expiry
     - Deserialize the reply bytes directly into `TResponse` (no envelope); return it. Business failure is read from `TResponse.Error`, not thrown
     - Exception-retry loop: on an exceptional failure (timeout, transport/broker error, or response-deserialization failure) wait `ExceptionRetryDelayMs` and resend, up to `MaxExceptionRetries` additional attempts (fresh messageId per attempt, caller correlationId reused); honor the caller's CancellationToken across attempts and the delay; throw the last exception when exhausted. Never retry a business `Success = false` response; never retry request-serialization failure
     - Implement `HandleReply` method called by the reply consumer; match the reply to a pending call by the reply's `MessageId`
     - Publish requests with `mandatory = connection.ConfirmPublish`; exclude `PublishException` from the exception-retry filter so a returned or rejected request fails at once
-    - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.11, 2.12, 2.13, 2.14_
+    - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.11, 2.12, 2.13, 2.14, 2.15_
 
   - [ ]* 5.2 Write property test for RPC round-trip matching
     - **Property 4: RPC Round-Trip Matching**
@@ -125,10 +125,10 @@ The implementation language is C# 14 / .NET 10.
     - For standard pattern: ACK on success, handle failures per retry logic
     - For RPC pattern: call ProcessAsync to get serialized `TResponse` bytes, publish them directly to the ReplyTo queue echoing the request's `MessageId` (the sender's match key) and `CorrelationId` on the reply, then ACK. Do NOT catch processor exceptions here — let them propagate to the shared failure path (retry/dead-letter); no reply is sent on an unexpected exception
     - Handle missing headers (NACK without requeue), unresolvable types (NACK without requeue), deserialization failures (NACK without requeue)
-    - Track retry count via `mq-retry-count` header; dead-letter when count >= MaxRetries
+    - Track retry count via `mq-retry-count` header; dead-letter when count >= MaxRetries. Retry and dead-letter copies keep the original's `Persistent` flag; RPC replies stay transient
     - Publish RPC replies, retry republishes and dead-letter publishes with `mandatory = connection.ConfirmPublish`; a `PublishException` on the RPC reply is logged as a warning and the request is still ACKed; on a republish it falls through to the NACK-without-requeue fallback
     - Implement `IAsyncDisposable` for graceful channel/connection close
-    - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3, 9.5_
+    - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3, 9.5, 9.6_
 
   - [ ]* 7.3 Write property test for consumer dispatch correctness
     - **Property 3: Consumer Dispatch Correctness**

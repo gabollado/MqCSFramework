@@ -51,6 +51,8 @@ internal sealed class RabbitMqStandardSender : IStandardSender
             CorrelationId = correlationId,
             Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
             ContentType = "application/json",
+            // Delivery mode 2: survives a broker restart in a durable classic queue.
+            Persistent = true,
             Headers = new Dictionary<string, object?>
             {
                 [MqHeaders.ProcessorType] = typeof(TProcessor).AssemblyQualifiedName,

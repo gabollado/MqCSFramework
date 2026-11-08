@@ -125,7 +125,7 @@ There is no separate `Port` setting: put a non-default port in `HostName` (`"rab
 | `SendAsync` completes when | the message is written to the network socket | the broker has accepted the message |
 | No queue matches the exchange/routing key (typo, queue not declared yet, missing binding) | message silently dropped, `SendAsync` still succeeds | throws `PublishReturnException` |
 | The broker rejects the message (e.g. a queue length limit with `overflow: reject-publish`) | message lost, `SendAsync` still succeeds | throws `PublishException` |
-| Cost per publish | none | waits for the broker's ack: about a millisecond locally, up to a few hundred milliseconds for persistent messages on durable or quorum queues under load |
+| Cost per publish | none | waits for the broker's ack: about a millisecond locally, up to a few hundred milliseconds under load, because messages are persistent and the broker acks only after writing them to disk (or replicating them, for quorum queues) |
 
 ### Which side needs it
 

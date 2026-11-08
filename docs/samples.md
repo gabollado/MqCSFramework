@@ -131,4 +131,6 @@ Management UI: http://localhost:15672 (guest/guest)
 
 The framework declares queues automatically on consumer startup (durable, non-exclusive, non-auto-delete). No manual queue creation is needed for basic usage.
 
+Standard messages and RPC requests are always published as persistent, so a message waiting in one of these durable queues survives a broker restart. Retry and dead-letter copies keep that setting. RPC replies are not persistent, since their reply queue is temporary anyway.
+
 For RPC, the sender creates an exclusive auto-delete reply queue automatically.

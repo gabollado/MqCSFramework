@@ -35,6 +35,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 6. The message is serialized and published to the configured exchange/routing key
 7. Each send is bounded by the sender's timeout (`TimeoutMs`, default 20 seconds; 0 or less disables it), applied together with the caller's cancellation token. When the timeout expires the send fails with a timeout error; a caller's cancellation still surfaces as a cancellation
 8. With publisher confirms on (`ConfirmPublish`, a connection setting, default false), `SendAsync` completes only after the broker confirms the message. A message that no queue matches is returned by the broker and fails with `PublishReturnException`; a message the broker rejects fails with `PublishException` (its base type). Neither resets the channel. With confirms off, `SendAsync` completes once the message is written to the socket, and an unroutable or rejected message is lost without any error. The documentation recommends turning confirms on for standard senders, since a standard send has no other feedback
+9. Messages are published as persistent (AMQP delivery mode 2), so a message waiting in a durable classic queue survives a broker restart. Quorum queues store every message on disk regardless of delivery mode
 
 ### Requirement 2: RPC Messaging (Request-Reply)
 
@@ -56,6 +57,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 12. A business failure (a `TResponse` returned with `Error` set / `Success` false) is NOT an exceptional failure and is NEVER retried — it is a normal return value handed straight back to the caller
 13. Because a retry resends the request, RPC exception-retry is only safe for **idempotent** operations: if the original request reached the consumer and was processed but its reply was lost or late, a retry causes the consumer to process the request again. Callers that cannot tolerate double-processing should leave `MaxExceptionRetries` at 0
 14. With publisher confirms on (`ConfirmPublish`), a request the broker returns (no queue matched) or rejects fails at once with `PublishException` instead of ending as `RpcTimeoutException` after the full timeout. It is not retried: no consumer will answer it, and the channel is still healthy. Confirms matter less for RPC than for standard sends, because a lost request already surfaces as a timeout; they only make it fail sooner and with a clearer error
+15. RPC requests are published as persistent, like standard messages. RPC replies are not: the reply queue is exclusive and non-durable, so a persistent reply would not survive a broker restart anyway
 
 ### Requirement 3: Consumer and Processor Resolution
 
@@ -149,6 +151,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 3. Dead-letter support: messages exceeding a retry limit are routed to an error queue
 4. This path applies to both standard and RPC processors: an unexpected exception from an RPC processor is NACK'd/retried/dead-lettered exactly like a standard message. No error response is published to the reply queue — business failures must instead be returned as an `RpcError` on the response (see Requirement 2)
 5. With publisher confirms on (`ConfirmPublish`), the consumer's own publishes are confirmed too. A retry or dead-letter republish the broker returns or rejects is logged and the original message is NACKed without requeue instead of being acknowledged (with confirms off, such a republish is lost and the original is still acknowledged). An RPC reply that cannot be delivered (the reply queue is gone, e.g. the sender stopped) is logged as a warning and the request is still acknowledged, so it is not processed again
+6. Retry and dead-letter copies keep the original message's persistence, so a persistent message stays persistent in the dead-letter queue
 
 ## Non-Functional Requirements
 
