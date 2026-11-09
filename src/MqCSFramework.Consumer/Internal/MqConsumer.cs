@@ -36,15 +36,7 @@ internal sealed class MqConsumer : IAsyncDisposable
     {
         _connection = new RabbitMqConnection(_options.Connection, _logger);
         _channel = await _connection.GetChannelAsync(ct);
-
-        // Declare queue (idempotent — creates if not exists, no-op if already exists)
-        await _channel.QueueDeclareAsync(
-            queue: _options.QueueName,
-            durable: true,
-            exclusive: false,
-            autoDelete: false,
-            arguments: _options.BrokerRetry ? new Dictionary<string, object?> { ["x-queue-type"] = "quorum" } : null,
-            cancellationToken: ct);
+        await EnsureQueueAsync(ct);
 
         await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: _options.PrefetchCount, global: false, cancellationToken: ct);
 
@@ -59,6 +51,36 @@ internal sealed class MqConsumer : IAsyncDisposable
 
         _logger.LogInformation("Consumer started on queue '{QueueName}' with prefetch {PrefetchCount}",
             _options.QueueName, _options.PrefetchCount);
+    }
+
+    /// <summary>
+    /// Uses an existing queue as it is (any type or arguments, so no 406 on redeclare);
+    /// only a missing queue is declared, as a quorum queue.
+    /// </summary>
+    private async Task EnsureQueueAsync(CancellationToken ct)
+    {
+        try
+        {
+            await _channel!.QueueDeclarePassiveAsync(_options.QueueName, ct);
+            _logger.LogInformation("Queue '{QueueName}' exists; using it as it is", _options.QueueName);
+            return;
+        }
+        catch (OperationInterruptedException ex) when (ex.ShutdownReason?.ReplyCode == Constants.NotFound)
+        {
+            // The broker closes the channel on 404, so declare on a new one.
+        }
+
+        await _connection!.ResetChannelAsync();
+        _channel = await _connection.GetChannelAsync(ct);
+
+        await _channel.QueueDeclareAsync(
+            queue: _options.QueueName,
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-queue-type"] = "quorum" },
+            cancellationToken: ct);
+        _logger.LogInformation("Queue '{QueueName}' declared as a quorum queue", _options.QueueName);
     }
 
     private async Task DispatchMessageAsync(object sender, BasicDeliverEventArgs ea)
@@ -215,78 +237,18 @@ internal sealed class MqConsumer : IAsyncDisposable
 
     private async Task HandleFailureAsync(BasicDeliverEventArgs ea, string messageId)
     {
-        if (_options.BrokerRetry)
+        if (!_options.Retry)
         {
-            // basic.reject (not nack) increments the quorum queue's delivery count; the policy applies delay,
-            // delivery-limit and dead-lettering.
-            await _channel!.BasicRejectAsync(ea.DeliveryTag, requeue: true);
-            _logger.LogWarning("Message {MessageId} failed. Rejected for broker retry.", messageId);
+            // Dead-lettered through the queue's dead-letter exchange, or dropped when it has none.
+            await _channel!.BasicRejectAsync(ea.DeliveryTag, requeue: false);
+            _logger.LogWarning("Message {MessageId} failed. Rejected without requeue (dead-lettered if the queue has a dead-letter exchange).", messageId);
             return;
         }
 
-        var retryCount = MessageHelpers.GetRetryCount(ea);
-
-        if (retryCount < _options.MaxRetries)
-        {
-            // Retry: republish with incremented retry header and ACK the original
-            var headers = ea.BasicProperties?.Headers != null
-                ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
-                : new Dictionary<string, object?>();
-            headers[MqHeaders.RetryCount] = retryCount + 1;
-
-            var retryProps = new BasicProperties
-            {
-                MessageId = ea.BasicProperties?.MessageId,
-                CorrelationId = ea.BasicProperties?.CorrelationId,
-                Timestamp = ea.BasicProperties?.Timestamp ?? new AmqpTimestamp(0),
-                ContentType = ea.BasicProperties?.ContentType,
-                Persistent = ea.BasicProperties?.Persistent ?? false,
-                ReplyTo = ea.BasicProperties?.ReplyTo,
-                Headers = headers
-            };
-
-            // With ConfirmPublish a returned or rejected copy throws PublishException before the ACK below,
-            // so the caller's fallback NACKs the original instead of acknowledging a lost copy.
-            // Back to this consumer's own queue via the default exchange, so a fanout/topic exchange
-            // doesn't hand the copy to every other bound queue again.
-            await _channel!.BasicPublishAsync(
-                "",
-                _options.QueueName,
-                _connection!.ConfirmPublish, retryProps, ea.Body, CancellationToken.None);
-
-            await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
-
-            _logger.LogWarning("Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued.",
-                messageId, retryCount + 1, _options.MaxRetries);
-            return;
-        }
-
-        if (!string.IsNullOrEmpty(_options.DeadLetterExchange))
-        {
-            _logger.LogWarning("Message {MessageId} exceeded max retries ({MaxRetries}). Routing to dead-letter.",
-                messageId, _options.MaxRetries);
-
-            var dlProps = new BasicProperties
-            {
-                MessageId = ea.BasicProperties?.MessageId,
-                CorrelationId = ea.BasicProperties?.CorrelationId,
-                ContentType = ea.BasicProperties?.ContentType,
-                Persistent = ea.BasicProperties?.Persistent ?? false,
-                Headers = ea.BasicProperties?.Headers != null
-                    ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
-                    : new Dictionary<string, object?>()
-            };
-
-            await _channel!.BasicPublishAsync(
-                _options.DeadLetterExchange,
-                _options.DeadLetterRoutingKey ?? "",
-                _connection!.ConfirmPublish, dlProps, ea.Body, CancellationToken.None);
-
-            await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
-            return;
-        }
-
-        await NackWithoutRequeueAsync(ea);
+        // basic.reject (not nack) increments the quorum queue's delivery count; the policy applies delay,
+        // delivery-limit and dead-lettering. On a classic queue the message comes back immediately.
+        await _channel!.BasicRejectAsync(ea.DeliveryTag, requeue: true);
+        _logger.LogWarning("Message {MessageId} failed. Rejected with requeue for broker retry.", messageId);
     }
 
     private void LogMessageBody(BasicDeliverEventArgs ea, string messageId)

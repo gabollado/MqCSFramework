@@ -40,7 +40,7 @@ The implementation language is C# 14 / .NET 10.
     - Create `RabbitMqConnectionOptions` (HostName [comma-separated `host` or `host:port`, no separate port property], UserName, Password, VirtualHost, UseSsl, SslServerName, ClientProvidedName, RequestedConnectionTimeout [default 30s, connect budget per host], ConfirmPublish [default false, publisher confirms + mandatory for every publish on the connection])
     - Create `StandardSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 20000, <= 0 disables])
     - Create `RpcSenderOptions` (Connection, Exchange, RoutingKey, TimeoutMs [int ms, default 30000], MaxExceptionRetries [default 0], ExceptionRetryDelayMs [int ms, default 1000])
-    - Create `ConsumerOptions` (Connection, QueueName, PrefetchCount, MaxRetries, DeadLetterExchange, DeadLetterRoutingKey, SuppressMessageBodyLogging, MaskedFields, BrokerRetry [default false, quorum queue + reject requeue])
+    - Create `ConsumerOptions` (Connection, QueueName, PrefetchCount, SuppressMessageBodyLogging, MaskedFields, Retry [default false: reject without requeue; true: reject with requeue for broker retry]; no retry-count or dead-letter options, the broker handles them)
     - Create `SendOptions` (RoutingKey, CorrelationId, AdditionalHeaders)
     - Create `RpcOptions` (RoutingKey, TimeoutMs [nullable int ms override], MaxExceptionRetries [nullable override], ExceptionRetryDelayMs [nullable int ms override], AdditionalHeaders)
     - _Requirements: 4.1, 5.2, 5.3, 5.4, 8.3, 8.4, 9.3_
@@ -124,13 +124,13 @@ The implementation language is C# 14 / .NET 10.
     - Implement `StartAsync`: create connection, create channel, set BasicQos (prefetchCount), register `AsyncEventingBasicConsumer`, subscribe to `ReceivedAsync`, call `BasicConsumeAsync` with `autoAck: false`
     - Implement `DispatchMessage`: read `mq-processor-type` header → `Type.GetType` → resolve from DI → deserialize body → call `ProcessAsync`
     - For standard pattern: ACK on success, handle failures per retry logic
-    - For RPC pattern: call ProcessAsync to get serialized `TResponse` bytes, publish them directly to the ReplyTo queue echoing the request's `MessageId` (the sender's match key) and `CorrelationId` on the reply, then ACK. Do NOT catch processor exceptions here — let them propagate to the shared failure path (retry/dead-letter); no reply is sent on an unexpected exception
+    - For RPC pattern: call ProcessAsync to get serialized `TResponse` bytes, publish them directly to the ReplyTo queue echoing the request's `MessageId` (the sender's match key) and `CorrelationId` on the reply, then ACK. Do NOT catch processor exceptions here — let them propagate to the shared failure path (reject, requeue = Retry); no reply is sent on an unexpected exception
     - Handle missing headers (NACK without requeue), unresolvable types (NACK without requeue), deserialization failures (NACK without requeue)
-    - Track retry count via `mq-retry-count` header; dead-letter when count >= MaxRetries (`MaxRetries <= 0` = no retry). Republish retry copies to the consumer's own queue (default exchange `""`, routing key `QueueName`), not the original exchange/routing key. Retry and dead-letter copies keep the original's `Persistent` flag; RPC replies stay transient
-    - When `BrokerRetry` is true: declare the queue with `x-queue-type: quorum` and, on failure, `BasicRejectAsync(requeue: true)` instead of the framework retry/dead-letter path (delay, limit and DLX come from a RabbitMQ policy)
-    - Publish RPC replies, retry republishes and dead-letter publishes with `mandatory = connection.ConfirmPublish`; a `PublishException` on the RPC reply is logged as a warning and the request is still ACKed; on a republish it falls through to the NACK-without-requeue fallback
+    - On startup passive-declare the queue; only on 404 reset the channel and declare it with `x-queue-type: quorum`. An existing queue is used as it is
+    - On a processor failure call `BasicRejectAsync(requeue: options.Retry)` (delay, limit and DLX come from the broker; no framework retry count, republish or dead-letter publish). RPC replies stay transient
+    - Publish RPC replies with `mandatory = connection.ConfirmPublish`; a `PublishException` on the RPC reply is logged as a warning and the request is still ACKed
     - Implement `IAsyncDisposable` for graceful channel/connection close
-    - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3, 9.5, 9.6, 9.7, 9.8_
+    - _Requirements: 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6_
 
   - [ ]* 7.3 Write property test for consumer dispatch correctness
     - **Property 3: Consumer Dispatch Correctness**
@@ -142,9 +142,9 @@ The implementation language is C# 14 / .NET 10.
     - Generate random exceptions thrown by processors, verify the consumer NACKs the message and does not crash (continues processing)
     - **Validates: Requirements 9.1, 9.2**
 
-  - [ ]* 7.5 Write property test for dead-letter routing
-    - **Property 7: Dead-Letter Routing on Retry Exhaustion**
-    - Generate messages with varying retry counts (some below, some at/above MaxRetries), verify messages at/above threshold are published to dead-letter exchange instead of being requeued
+  - [ ]* 7.5 Write property test for failure rejection
+    - **Property 7: Failed Messages Are Rejected, Requeued Only With Retry**
+    - For failing messages, verify the consumer calls `BasicRejectAsync(requeue: Retry)` and never publishes or ACKs
     - **Validates: Requirements 9.3**
 
 - [ ] 8. Implement logging and sensitive field masking
@@ -222,13 +222,14 @@ The implementation language is C# 14 / .NET 10.
     - Send an RPC request via `IRpcSender`, have a consumer process it and return a response, verify the sender receives the correct typed response
     - Test business failure: processor returns a `TResponse` with `Error` set → sender receives it with `Success == false` and `Error` intact (no exception)
     - Test timeout behavior (no consumer, short timeout → `RpcTimeoutException`)
-    - Test unexpected exception: processor throws → no reply published, message dead-lettered after retries, sender observes `RpcTimeoutException`
+    - Test unexpected exception: processor throws → no reply published, message dead-lettered by the broker after the delivery limit, sender observes `RpcTimeoutException`
     - _Requirements: 2.3, 2.4, 2.5, 2.6, 2.8, 2.9, 2.10, 9.4_
 
-  - [ ] 12.3 Write integration test for dead-letter routing
-    - Configure a consumer with MaxRetries = 2 and a dead-letter exchange
+  - [ ] 12.3 Write integration test for dead-letter routing (RabbitMQ 4.3+)
+    - Configure a consumer with `Retry = true` on a new (quorum) queue
+    - Create a policy on the consumer queue with a short delayed retry, `delivery-limit` 2 and a dead-letter exchange bound to a queue
     - Send a message that always fails processing
-    - Verify the message ends up on the dead-letter queue after retry exhaustion
+    - Verify the message ends up on the dead-letter queue after the delivery limit
     - _Requirements: 9.1, 9.2, 9.3_
 
 - [ ] 13. Final checkpoint - Full solution verification

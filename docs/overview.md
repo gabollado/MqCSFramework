@@ -13,7 +13,7 @@ MqCSFramework is an open-source .NET 10 framework that simplifies RabbitMQ messa
 - **Zero-reflection dispatch** — the consumer resolves processors from DI and calls them via non-generic base interfaces (no runtime reflection)
 - **Independent connections** — each sender and consumer manages its own RabbitMQ connection, allowing one service to connect to multiple brokers
 - **Configuration from appsettings.json** — one-line setup with `AddMqCSFramework(configuration)`
-- **Automatic retry and dead-letter** — failed messages are retried up to a configurable limit, then routed to an error queue
+- **Broker-side dead-letter and retry** — failed messages go to the queue's dead-letter exchange; with `Retry` on a quorum queue (RabbitMQ 4.3+) RabbitMQ first retries them with a delay and a limit set by a policy
 - **Structured logging** — Serilog integration with configurable message body masking for sensitive fields
 - **Simple processor model** — inherit from `StandardProcessor<T>` or `RpcProcessor<TReq, TRes>`, implement one method
 

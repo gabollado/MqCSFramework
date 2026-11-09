@@ -124,7 +124,7 @@ There is no separate `Port` setting: put a non-default port in `HostName` (`"rab
 
 > **Recommendation:** set `"ConfirmPublish": true` on the `Connection` of every **standard sender**. With the default `false`, `SendAsync` can succeed for a message that the broker never stored. For **RPC senders** it is optional.
 
-`ConfirmPublish` lives on `Connection`, so it applies to everything that publishes through that connection: standard senders, RPC senders, and consumers (their RPC replies, retry republishes and dead-letter publishes). The default is `false`.
+`ConfirmPublish` lives on `Connection`, so it applies to everything that publishes through that connection: standard senders, RPC senders, and consumers (their RPC replies). The default is `false`.
 
 | | `false` (default) | `true` |
 |---|---|---|
@@ -137,7 +137,7 @@ There is no separate `Port` setting: put a non-default port in `HostName` (`"rab
 
 - **Standard senders — turn it on.** A fire-and-forget send has no other way to find out the message was lost.
 - **RPC senders — optional.** A request that never reaches a queue already ends as `RpcTimeoutException`, because no reply comes back. With `true` it fails at once with `PublishException` instead of after the full timeout, and it is not retried (no consumer could answer it).
-- **Consumers — recommended when you use retries or a dead-letter exchange.** With `false`, a retry or dead-letter copy that the broker drops is lost, and the original message is still acknowledged. With `true`, the failure is logged and the original is NACKed instead. An RPC reply that can't be delivered (the sender is gone) is only logged; the request is not processed again.
+- **Consumers — not needed.** Retries and dead-lettering happen inside RabbitMQ, so the consumer publishes nothing but RPC replies. With `true`, an RPC reply that can't be delivered (the sender is gone) is logged; the request is not processed again.
 
 ### Handling the exceptions
 
@@ -227,7 +227,7 @@ Configuration for a request-reply sender. `Connection.ConfirmPublish` is optiona
 
 ## ConsumerOptions
 
-Configuration for a message consumer. If you use retries or a dead-letter exchange, set `Connection.ConfirmPublish` to `true` so a copy the broker doesn't accept is never acknowledged away (see [Publisher confirms](#publisher-confirms-confirmpublish)).
+Configuration for a message consumer. On startup the consumer uses the queue as it is if it already exists (classic or quorum, any arguments); otherwise it creates it as a quorum queue. Failed messages are dead-lettered by default; RabbitMQ can retry them instead (see [Retries and dead-lettering](#retries-and-dead-lettering)).
 
 If a consumer can't start (for example its broker is down, or the connect times out), the error is logged and the start is retried every 10 seconds until it works or the application stops. The application keeps running, and the other consumers start independently.
 
@@ -236,31 +236,41 @@ If a consumer can't start (for example its broker is down, or the connect times 
 | `Connection` | RabbitMqConnectionOptions | (see above) | Connection settings for this consumer |
 | `QueueName` | string | `""` | Queue to consume from (declared automatically on startup) |
 | `PrefetchCount` | ushort | `10` | Number of unacknowledged messages allowed (controls parallelism) |
-| `MaxRetries` | int | `3` | Maximum retry attempts before dead-lettering. `0` = no retry: the first failure goes to the dead-letter exchange, or is NACKed without requeue if none is set. A retry copy is republished to this consumer's own queue (`QueueName`) |
-| `DeadLetterExchange` | string? | `null` | Exchange to publish failed messages to after retry exhaustion |
-| `DeadLetterRoutingKey` | string? | `null` | Routing key for dead-letter messages |
 | `SuppressMessageBodyLogging` | bool | `false` | When true, message bodies are not included in log output |
 | `MaskedFields` | string[] | `[]` | JSON field names whose values are replaced with `***MASKED***` in logs |
-| `BrokerRetry` | bool | `false` | Let RabbitMQ handle retries: the queue is declared as a quorum queue and failed messages are rejected with requeue. `MaxRetries`, `DeadLetterExchange` and `DeadLetterRoutingKey` are ignored. See [Broker retry](#broker-retry-quorum-queues) |
+| `Retry` | bool | `false` | `false`: a failed message is dead-lettered (or dropped if the queue has no dead-letter exchange). `true`: RabbitMQ retries it. **Quorum queues only** (see below) |
 
-### Broker retry (quorum queues)
+The delay, retry limit and dead-letter exchange are not consumer settings; they live in RabbitMQ (a policy, or the queue's own arguments).
 
-With `"BrokerRetry": true` the framework doesn't count retries. It declares the queue with `x-queue-type: quorum`, and on failure rejects the message with requeue. RabbitMQ then counts the deliveries and applies the delay, the limit and the dead-lettering from a policy.
+### Retries and dead-lettering
 
-Requirements and caveats:
+When a processor throws, the consumer rejects the message. `Retry` decides whether it goes back to the queue:
+
+| | `Retry = false` (default) | `Retry = true` |
+|---|---|---|
+| Quorum queue | Dead-lettered on the first failure | RabbitMQ retries it with the delay and limit from a policy, then dead-letters it (RabbitMQ 4.3+) |
+| Classic queue | Dead-lettered on the first failure | ⚠️ **Redelivered immediately and forever.** Classic queues have no delayed retry and no delivery limit. Don't use `Retry = true` on a classic queue |
+
+"Dead-lettered" means sent to the queue's dead-letter exchange. **If the queue has none, the message is dropped**, so set a `dead-letter-exchange` (policy or queue argument) on every consumer queue. A message that can never be processed (missing headers, unknown processor) is always dead-lettered at once, whatever `Retry` is.
+
+The consumer can't see the queue type (RabbitMQ doesn't report it to a client), so it's up to you to set `Retry` to match the queue.
+
+Requirements and caveats for `Retry = true`:
 
 - **RabbitMQ 4.3 or later.** Delayed retry exists only on quorum queues from 4.3.
-- **The queue type can't change.** If the queue already exists as a classic queue, the consumer fails to start with `406 PRECONDITION_FAILED`. Delete and recreate the queue (or switch to a new queue name) when you turn this on.
+- **Quorum queue.** A queue the consumer creates is always quorum. A queue that already exists keeps its type; to change a classic queue to quorum, delete it and let the consumer recreate it (step 2 below).
 - **Set a policy.** Without one, a failed message is redelivered immediately until it has failed more than 20 times (RabbitMQ's default delivery limit), and then it is dropped.
 - **Set a dead-letter exchange in the policy** if you don't want messages over the limit dropped. If that exchange doesn't exist, RabbitMQ drops them silently.
 
 #### RabbitMQ setup
 
-The example below uses the consumer queue `orders-queue` on vhost `/`. It retries after 1s, 2s, 3s… capped at 30s. After more than 10 failures the message goes to the queue `orders-queue.dead`.
+For `Retry = false` only step 3 and a policy with `dead-letter-exchange` are needed (classic queues accept it too: use `--apply-to queues`).
+
+The example below uses the consumer queue `orders-queue` on vhost `/` with `"Retry": true`. It retries after 1s, 2s, 3s… capped at 30s. After more than 10 failures the message goes to the queue `orders-queue.dead`.
 
 **1. Check the version.** The management UI shows it at the top of every page, or run `rabbitmqctl version`. It must be 4.3 or later.
 
-**2. Remove the old queue if it is classic.** Skip this for a new queue. In the management UI, open *Queues and Streams*: the *Type* column must say `quorum`. If it says `classic`, stop the consumers, move or drain any messages you need, then delete the queue (queue page → *Delete*). The consumer recreates it as quorum on startup.
+**2. Remove the old queue if it is classic.** Skip this for a new queue. In the management UI, open *Queues and Streams*: the *Type* column must say `quorum`. If it says `classic`, stop the consumers, move or drain any messages you need, then delete the queue (queue page → *Delete*). The consumer recreates it as quorum on startup. Then set `"Retry": true` on the consumer.
 
 **3. Create the dead-letter exchange and queue.** A `fanout` exchange sends every dead-lettered message to its queue whatever its routing key is.
 
@@ -341,9 +351,7 @@ References: [quorum queues: delayed retry and poison message handling](https://w
     },
     "QueueName": "orders-queue",
     "PrefetchCount": 20,
-    "MaxRetries": 5,
-    "DeadLetterExchange": "orders-dlx",
-    "DeadLetterRoutingKey": "orders.dead",
+    "Retry": true,
     "SuppressMessageBodyLogging": false,
     "MaskedFields": ["password", "creditCard", "token"]
   }

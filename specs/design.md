@@ -138,7 +138,7 @@ Consumer side:
 2. Consumer resolves the type by name → resolves from DI via the service provider
 3. Casts to `IMessageProcessor` (non-generic) → calls `ProcessRawAsync(body, context, cancellationToken)`
 4. Cancellation token created from `ConsumerOptions.ProcessingTimeoutMs`
-5. On success: ACK. On failure: retry logic (framework mode: increment `mq-retry-count`, republish to the consumer's own queue, dead-letter if exceeded; `BrokerRetry` mode: reject with requeue and let the broker apply the policy)
+5. On success: ACK. On failure: reject, with requeue only when `Retry` is true; the broker applies delay, limit and dead-lettering
 
 ### Message Flow — RPC Pattern
 
@@ -153,7 +153,7 @@ Consumer side:
 9. Consumer receives, resolves processor, calls `ProcessRawRpcAsync` which returns the serialized `TResponse` bytes
 10. Consumer publishes those bytes directly to the `ReplyTo` queue, echoing the request's `MessageId` back on the reply's `MessageId` (so the sender can match it) and the request's `CorrelationId` on the reply's `CorrelationId` (for trace continuity). No wrapping envelope
 11. Cancellation token for RPC processing: created from `mq-cancellation-deadline` header (remaining time until deadline)
-12. If the processor throws an unexpected exception: nothing is published to the reply queue. The failure follows the standard NACK/retry/dead-letter path (see Error Handling). The sender observes a timeout
+12. If the processor throws an unexpected exception: nothing is published to the reply queue. The failure follows the standard reject path (see Error Handling). The sender observes a timeout
 13. Sender matches the reply to the pending request by `MessageId`, then deserializes the reply bytes directly into `TResponse` (which extends `RpcResponse`). Business success/failure is read from `TResponse.Success`/`TResponse.Error` — set by the processor, not signaled by an exception
 
 **Why match by `MessageId` and not `CorrelationId`:** `correlationId` identifies a logical process/transaction and is intentionally reusable across multiple messages (and across retries of one message), so it is not unique per request. Keying reply matching on it would let two concurrent calls that share a correlation id collide in the pending map (one reply resolving the wrong call). `MessageId` is generated fresh per message and per retry attempt, so it is the only correct match key. `correlationId` is reserved for logging/tracing on both the sender and the consumer.
@@ -240,7 +240,6 @@ Static class containing well-known header name constants used by the framework.
 Constants:
   - ProcessorType = "mq-processor-type"
   - Pattern = "mq-pattern"
-  - RetryCount = "mq-retry-count"
   - PatternStandard = "standard"
   - PatternRpc = "rpc"
   - CancellationDeadline = "mq-cancellation-deadline"
@@ -315,7 +314,7 @@ Constructor parameters:
 Message format: "RPC call {correlationId} timed out after {timeout.TotalSeconds}s"
 ```
 
-Note: there is intentionally no `RpcRemoteException`. Remote processors do not send exceptions back to the sender. Business failures are expressed as an `RpcError` on the response (see `RpcResponse` below); unexpected processor exceptions follow the standard NACK/retry/dead-letter path and surface to the sender only as a timeout.
+Note: there is intentionally no `RpcRemoteException`. Remote processors do not send exceptions back to the sender. Business failures are expressed as an `RpcError` on the response (see `RpcResponse` below); unexpected processor exceptions follow the standard reject path and surface to the sender only as a timeout.
 
 #### RpcResponse (Public, abstract)
 
@@ -844,15 +843,15 @@ Properties:
   - Connection: RabbitMqConnectionOptions (default new instance)
   - QueueName: string (default "")
   - PrefetchCount: unsigned short integer (default 10)
-  - MaxRetries: integer (default 3). Framework retries per message; 0 or less = no retry
   - ProcessingTimeoutMs: integer (default 30000)
-  - DeadLetterExchange: string or null (default null)
-  - DeadLetterRoutingKey: string or null (default null)
   - MaskedFields: read-only list of strings (default empty list)
-  - BrokerRetry: boolean (default false). When true the queue is declared as a quorum queue and failed
-    messages are rejected with requeue; delay, retry limit and dead-lettering come from a RabbitMQ policy
-    (RabbitMQ 4.3+). MaxRetries, DeadLetterExchange and DeadLetterRoutingKey are not used in this mode
+  - Retry: boolean (default false). False: a failed message is rejected without requeue (dead-lettered
+    through the queue's DLX, or dropped). True: rejected with requeue, so the broker retries it; on a
+    quorum queue (RabbitMQ 4.3+) a policy sets delay, limit and dead-lettering, on a classic queue it is
+    redelivered immediately and forever
 ```
+
+There are no retry-count or dead-letter options: delay, limit and dead-lettering belong to the broker (policy or queue arguments).
 
 Note: `ConsumerOptions` does NOT have a `SuppressMessageBodyLogging` property. Body logging is at debug level and is controlled via per-namespace log level overrides in configuration.
 
@@ -1025,8 +1024,9 @@ Parameters:
 Behavior:
   1. Create a new RabbitMqConnection with options.Connection and the logger
   2. Get a channel from the connection
-  3. Declare queue (idempotent): name=options.QueueName, durable=true, exclusive=false, autoDelete=false,
-     arguments = { "x-queue-type": "quorum" } when options.BrokerRetry, otherwise none
+  3. Ensure the queue (EnsureQueueAsync, see Queue Declaration): passive declare; on 404 reset the
+     channel, get a new one, and declare name=options.QueueName, durable=true, exclusive=false,
+     autoDelete=false, arguments = { "x-queue-type": "quorum" }
   4. Set prefetch: prefetchSize=0, prefetchCount=options.PrefetchCount, global=false
   5. Create an async event consumer, attach DispatchMessageAsync to its received event
   6. Start consuming: queue=options.QueueName, autoAck=false
@@ -1082,7 +1082,7 @@ Behavior:
      - If cast fails: log error, NACK without requeue, return
   2. Call processor.ProcessRawRpcAsync(body, context, rpcTimeoutToken) to get the serialized TResponse bytes.
      This is NOT wrapped in a try/catch here — an unexpected exception propagates to the caller
-     (DispatchMessageCoreAsync), which routes it to HandleFailureAsync (NACK/retry/dead-letter).
+     (DispatchMessageCoreAsync), which routes it to HandleFailureAsync (reject, requeue = Retry).
      No reply is published on failure; the sender will time out.
   3. Read ReplyTo from message properties
   4. If ReplyTo is not empty:
@@ -1122,7 +1122,7 @@ Behavior:
   Return its token
 ```
 
-**Retry and dead-letter logic (HandleFailureAsync):**
+**Failure handling (HandleFailureAsync):**
 
 ```
 Method: HandleFailureAsync (private)
@@ -1130,35 +1130,17 @@ Parameters:
   - deliveryEventArgs: the received message event
   - messageId: string
 Behavior:
-  0. If options.BrokerRetry:
-     - Reject the message with requeue = true (basic.reject increments the quorum delivery count;
-       the broker's policy applies delayed-retry, delivery-limit and dead-letter-exchange)
-     - Log warning: "Message {MessageId} failed. Rejected for broker retry."
+  1. If NOT options.Retry:
+     - Reject the message with requeue = false (dead-lettered through the queue's DLX, or dropped)
+     - Log warning: "Message {MessageId} failed. Rejected without requeue (dead-lettered if the queue has a dead-letter exchange)."
      - Return
-  1. Read current retry count from headers via MessageHelpers.GetRetryCount (0 if not present)
-  2. If retries NOT exhausted (retryCount < MaxRetries; MaxRetries <= 0 means no retry):
-     - Copy all headers from original (or create empty dictionary if none)
-     - Set "mq-retry-count" = retryCount + 1
-     - Create new properties copying: MessageId, CorrelationId, Timestamp, ContentType, Persistent, ReplyTo, Headers
-     - Republish to the consumer's own queue: exchange "" (default exchange), routing key options.QueueName.
-       Not the original exchange/routing key, so a fanout/topic exchange does not deliver the copy to
-       other bound queues again
-     - ACK the original message
-     - Log warning: "Message {MessageId} failed (retry {RetryCount}/{MaxRetries}). Requeued."
-     - Return
-  3. If DeadLetterExchange is configured (not null/empty):
-     - Log warning: "Message {MessageId} exceeded max retries. Routing to dead-letter."
-     - Create new properties copying: MessageId, CorrelationId, ContentType, Persistent, Headers from original
-     - Publish to DeadLetterExchange with DeadLetterRoutingKey (or "" if null)
-     - ACK the original message
-     - Return
-  4. Otherwise: NACK without requeue
+  2. Reject the message with requeue = true (basic.reject increments the quorum delivery count;
+     the broker's policy applies delayed-retry, delivery-limit and dead-letter-exchange)
+  3. Log warning: "Message {MessageId} failed. Rejected with requeue for broker retry."
 
-  Both republishes use mandatory = connection.ConfirmPublish. With confirms on, a republish the broker
-  returns or rejects throws PublishException BEFORE the ACK; it propagates to DispatchMessageCoreAsync's
-  fallback, which logs it and NACKs the original without requeue. So the original is never acknowledged
-  for a copy the broker did not accept. With confirms off, such a copy is lost and the original is
-  still acknowledged.
+  If the reject throws (e.g. the channel closed), DispatchMessageCoreAsync's fallback logs it and
+  tries a NACK without requeue. When the channel is gone both fail; the broker then requeues the
+  unacknowledged message itself, and a lost consumer channel also increments the delivery count.
 ```
 
 **Body logging:**
@@ -1196,18 +1178,6 @@ Behavior:
   If value is byte array: decode as UTF-8 string
   If value is string: return as-is
   Otherwise: call toString on the value
-
-Method: GetRetryCount (static)
-Parameters:
-  - deliveryEventArgs: the received message event
-Returns: integer
-Behavior:
-  If message has no headers: return 0
-  If "mq-retry-count" header not found: return 0
-  If value is integer: return it
-  If value is long: cast to integer
-  If value is byte array: decode as UTF-8, try parse as integer (return 0 if not parseable)
-  Otherwise: return 0
 
 Method: BuildContext (static)
 Parameters:
@@ -1300,24 +1270,32 @@ On business failure (processor set `Error` on the response):
 
 `Success` is a computed property on `RpcResponse` (`Error is null`) and is not written to the wire; the receiver recomputes it after deserialization. An unexpected processor exception produces no reply at all (the sender times out).
 
-### Dead Letter Tracking
+### Retry and Dead-Lettering
 
-Retry count is tracked via a custom header `mq-retry-count` (integer). On each failure, the consumer:
-1. Reads the current retry count from the header (0 if not present)
-2. If `retryCount >= MaxRetries` (always true when `MaxRetries <= 0`): publishes to dead-letter exchange (if configured) and ACKs, otherwise NACKs without requeue
-3. If under limit: republishes the message to its own queue (default exchange `""`, routing key `QueueName`) with `mq-retry-count` incremented by 1, preserving all other properties (MessageId, CorrelationId, Timestamp, ContentType, Persistent, ReplyTo, Headers), then ACKs the original. The dead-letter copy also keeps the original's Persistent flag
+Done by the broker, not by the framework. On a processor failure the consumer rejects the message; `ConsumerOptions.Retry` sets requeue:
 
-With `BrokerRetry = true` none of the above applies: the consumer rejects the message with requeue and the broker tracks the attempts in the quorum queue's delivery count (`x-delivery-count`). Delay (`delayed-retry-type/min/max`), limit (`delivery-limit`, default 20) and dead-lettering (`dead-letter-exchange`) are set by a RabbitMQ policy, not by the framework.
+| | `Retry = false` (default) | `Retry = true` |
+|---|---|---|
+| Quorum queue | dead-lettered on the first failure (or dropped without a DLX) | redelivered by the broker: delay (`delayed-retry-type/min/max`, RabbitMQ 4.3+), limit (`delivery-limit`, default 20) and dead-lettering (`dead-letter-exchange`) from a policy; the attempts are counted in `x-delivery-count` |
+| Classic queue | dead-lettered on the first failure (or dropped without a DLX) | redelivered immediately and forever (no delayed retry, no delivery limit) — documented as unsupported |
+
+A message that can never be processed (missing headers, unknown processor) is NACKed without requeue whatever `Retry` is, so it is dead-lettered (or dropped) at once.
 
 ### Queue Declaration
 
-The consumer declares its queue on startup with these settings:
-- durable: true
-- exclusive: false
-- autoDelete: false
-- arguments: none, or `x-queue-type: quorum` when `BrokerRetry = true`
+**Method: EnsureQueueAsync** (private, called from StartAsync)
 
-This is idempotent — creates if not exists, no-op if already exists. The queue type can only be set at declaration: declaring an existing classic queue as quorum (or the reverse) fails with 406 PRECONDITION_FAILED, so switching `BrokerRetry` on an existing queue requires recreating it.
+```
+Behavior:
+  1. Passive declare options.QueueName (QueueDeclarePassiveAsync)
+     - Succeeds: the queue exists; use it as it is (any type, any arguments). Return
+  2. On OperationInterruptedException with ShutdownReason.ReplyCode == 404 (NOT_FOUND):
+     - The broker closed the channel: connection.ResetChannelAsync(), then get a new channel
+     - Declare: durable=true, exclusive=false, autoDelete=false, arguments = { "x-queue-type": "quorum" }
+  Any other exception propagates (the hosted service retries the start)
+```
+
+Because an existing queue is never redeclared, a queue created elsewhere as classic, or with arguments such as a DLX or TTL, does not fail with 406 PRECONDITION_FAILED. A passive declare reports only the queue name, message count and consumer count, not the queue type, so the consumer cannot adapt `Retry` to the type by itself. Two consumers starting at once on a missing queue both get 404 and both declare it; the second declare is a no-op.
 
 ## DI Registration and Usage Patterns
 
@@ -1351,7 +1329,6 @@ services.AddMqConsumer("orders", options => {
     options.Connection.HostName = "rabbitmq.local"
     options.QueueName = "orders-queue"
     options.PrefetchCount = 20
-    options.MaxRetries = 3
     options.ProcessingTimeoutMs = 30000
     options.MaskedFields = ["password", "creditCard"]
 })
@@ -1427,10 +1404,7 @@ rpcSender = services.GetRequiredKeyedService<IRpcSender>("stock")
         },
         "QueueName": "orders-queue",
         "PrefetchCount": 20,
-        "MaxRetries": 3,
         "ProcessingTimeoutMs": 30000,
-        "DeadLetterExchange": "dead-letter",
-        "DeadLetterRoutingKey": "dead-letter-queue",
         "MaskedFields": ["password", "creditCard"]
       },
       "stock": {
@@ -1441,7 +1415,6 @@ rpcSender = services.GetRequiredKeyedService<IRpcSender>("stock")
         },
         "QueueName": "stock-queue",
         "PrefetchCount": 10,
-        "MaxRetries": 3,
         "ProcessingTimeoutMs": 30000
       }
     }
@@ -1478,7 +1451,7 @@ The RabbitMQ client library handles reconnection internally. The framework relie
 
 ### Publisher Confirms (ConfirmPublish)
 
-`RabbitMqConnectionOptions.ConfirmPublish` (default false) applies to every publish made through that connection: standard sends, RPC requests, and the consumer's RPC replies, retry republishes and dead-letter publishes.
+`RabbitMqConnectionOptions.ConfirmPublish` (default false) applies to every publish made through that connection: standard sends, RPC requests, and the consumer's RPC replies.
 
 - **Off (default):** the channel has no confirms and publishes use `mandatory = false`. A publish completes once it is written to the socket. A message that no queue matches is silently dropped by the broker, and a broker rejection goes unnoticed: `SendAsync` still returns a MessageId.
 - **On:** the channel is created with publisher confirmations and confirmation tracking, and publishes use `mandatory = true`. A publish completes only after the broker's ack. For persistent messages on durable or quorum queues that ack waits for the disk write or replication, so each publish can take from about a millisecond up to a few hundred milliseconds under load. Failures surface from the publish itself:
@@ -1486,7 +1459,7 @@ The RabbitMQ client library handles reconnection internally. The framework relie
   - broker rejected (nack) → `PublishException`
   - channel closed while waiting → `AlreadyClosedException`
 - `mandatory` is tied to `ConfirmPublish` because the RabbitMQ client only turns a returned message into an exception when confirms and tracking are on; without tracking the return arrives after the publish already completed.
-- Guidance (repeated in the user docs): turn it on for **standard senders**, whose `SendAsync` has no other feedback. For **RPC senders** it matters less: a lost request already ends as `RpcTimeoutException`; confirms only make it fail sooner and with a clearer error. For **consumers** it protects retry and dead-letter republishes.
+- Guidance (repeated in the user docs): turn it on for **standard senders**, whose `SendAsync` has no other feedback. For **RPC senders** it matters less: a lost request already ends as `RpcTimeoutException`; confirms only make it fail sooner and with a clearer error. For **consumers** it only affects RPC replies (an undeliverable reply is logged); retries and dead-lettering are done by the broker and involve no consumer publish.
 
 ### Channel Reset on Failure
 
@@ -1504,7 +1477,7 @@ Two distinct cases:
 
 **Business failure (expected):** the processor returns a `TResponse` with `Error` set to an `RpcError`. This serializes and travels back to the sender like any response. The sender returns the `TResponse`; the caller checks `response.Success` / `response.Error`. No exception anywhere.
 
-**Unexpected processor exception:** the consumer does NOT catch it in `DispatchRpcAsync`. It propagates to `DispatchMessageCoreAsync` → `HandleFailureAsync`, which applies the standard NACK/retry/dead-letter policy — identical to a standard-message failure. Nothing is published to the reply queue, so the sender's pending call ultimately fails with `RpcTimeoutException`. There is no `RpcRemoteException`; remote exception details are never transmitted to the sender.
+**Unexpected processor exception:** the consumer does NOT catch it in `DispatchRpcAsync`. It propagates to `DispatchMessageCoreAsync` → `HandleFailureAsync`, which rejects it (requeue = `Retry`) — identical to a standard-message failure. Nothing is published to the reply queue, so the sender's pending call ultimately fails with `RpcTimeoutException`. There is no `RpcRemoteException`; remote exception details are never transmitted to the sender.
 
 ### Logging
 
@@ -1559,7 +1532,7 @@ Two distinct cases:
 
 ### Property 5b: Unexpected Processor Exception Does Not Reach Sender
 
-*For any* RPC request where the processor throws an unexpected exception, the consumer SHALL NOT publish any reply, SHALL apply the standard failure policy (retry/dead-letter), and the sender SHALL observe `RpcTimeoutException` (never `RpcRemoteException`, which does not exist).
+*For any* RPC request where the processor throws an unexpected exception, the consumer SHALL NOT publish any reply, SHALL apply the standard failure path (reject, requeue = `Retry`), and the sender SHALL observe `RpcTimeoutException` (never `RpcRemoteException`, which does not exist).
 
 **Validates: Requirements 2.10, 9.4**
 
@@ -1575,11 +1548,11 @@ Two distinct cases:
 
 **Validates: Requirements 9.1, 9.2**
 
-### Property 7: Dead-Letter Routing on Retry Exhaustion
+### Property 7: Failed Messages Are Rejected, Requeued Only With Retry
 
-*For any* message with a retry count greater than or equal to `MaxRetries`, if a `DeadLetterExchange` is configured, the consumer SHALL publish the message to that exchange rather than requeuing it. If no dead-letter exchange is configured, the message is NACK'd without requeue. With `MaxRetries <= 0` this holds on the first failure. A retry copy under the limit is published to the default exchange with routing key `QueueName`. With `BrokerRetry = true` the consumer instead rejects with requeue and never republishes.
+*For any* message whose processor throws, the consumer SHALL reject it (`basic.reject`) with requeue equal to `ConsumerOptions.Retry`, and SHALL NOT publish anything or acknowledge it. Delay, retry limit and dead-lettering are left to the broker.
 
-**Validates: Requirements 9.3, 9.7, 9.8**
+**Validates: Requirements 9.3**
 
 ### Property 8: Sensitive Field Masking
 

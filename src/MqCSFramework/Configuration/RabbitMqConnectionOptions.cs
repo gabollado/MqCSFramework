@@ -32,7 +32,7 @@ public sealed class RabbitMqConnectionOptions
 
     /// <summary>
     /// Publisher confirms for every publish made through this connection (sender messages, RPC requests,
-    /// and the consumer's RPC replies, retry republishes and dead-letter publishes). Default false.
+    /// and the consumer's RPC replies). Default false.
     /// <para>
     /// False: a publish completes once it is written to the socket. A message that no queue matches is
     /// dropped by the broker and a broker rejection goes unnoticed, so <c>SendAsync</c> still succeeds.

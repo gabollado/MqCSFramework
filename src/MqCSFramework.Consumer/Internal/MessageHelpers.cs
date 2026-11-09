@@ -33,30 +33,6 @@ internal static class MessageHelpers
     }
 
     /// <summary>
-    /// Reads the mq-retry-count header as an integer. Returns 0 if not present.
-    /// </summary>
-    public static int GetRetryCount(BasicDeliverEventArgs ea)
-    {
-        if (ea.BasicProperties?.Headers is null)
-        {
-            return 0;
-        }
-
-        if (!ea.BasicProperties.Headers.TryGetValue(MqHeaders.RetryCount, out var value))
-        {
-            return 0;
-        }
-
-        return value switch
-        {
-            int i => i,
-            long l => (int)l,
-            byte[] bytes => int.TryParse(Encoding.UTF8.GetString(bytes), out var parsed) ? parsed : 0,
-            _ => 0
-        };
-    }
-
-    /// <summary>
     /// Builds a MessageContext from the RabbitMQ delivery event args.
     /// </summary>
     public static MessageContext BuildContext(BasicDeliverEventArgs ea, string messageId, string correlationId, string pattern)

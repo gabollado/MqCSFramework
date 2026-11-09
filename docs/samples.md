@@ -39,7 +39,7 @@ samples/
 
 Both sender and consumer read connection details from `appsettings.json` (format documented in [Configuration Reference](configuration.md)). The key specifics for the samples:
 
-- **Consumer queues:** `orders-queue` (standard, prefetch 20, max retries 3) and `stock-queue` (RPC, prefetch 10)
+- **Consumer queues:** `orders-queue` (standard, prefetch 20) and `stock-queue` (RPC, prefetch 10)
 - **Sender routing keys:** `orders-queue` (standard) and `stock-queue` (RPC, timeout 10s)
 - **Serilog:** Console + File sink to `C:\Logging\`
 - **Connection credentials:** Stored in `appsettings.local.json` (git-ignored) — copy `appsettings.json` and fill in your connection details
@@ -129,8 +129,8 @@ Management UI: http://localhost:15672 (guest/guest)
 
 ### Queue Configuration
 
-The framework declares queues automatically on consumer startup (durable, non-exclusive, non-auto-delete; quorum when `BrokerRetry` is on). No manual queue creation is needed for basic usage.
+The framework declares queues automatically on consumer startup as quorum queues when they don't exist yet; an existing queue is used as it is. No manual queue creation is needed for basic usage; dead-lettering and retries need RabbitMQ settings (see [Retries and dead-lettering](configuration.md#retries-and-dead-lettering)).
 
-Standard messages and RPC requests are always published as persistent, so a message waiting in one of these durable queues survives a broker restart. Retry and dead-letter copies keep that setting. RPC replies are not persistent, since their reply queue is temporary anyway.
+Standard messages and RPC requests are always published as persistent. RPC replies are not persistent, since their reply queue is temporary anyway.
 
 For RPC, the sender creates an exclusive auto-delete reply queue automatically.

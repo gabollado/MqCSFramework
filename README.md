@@ -11,7 +11,7 @@ MqCSFramework simplifies service-to-service messaging by providing a type-safe, 
 - **Zero-reflection dispatch** — processors resolved from DI, called via non-generic interface
 - **Independent connections** — each sender/consumer has its own RabbitMQ connection
 - **One-line configuration** — `builder.Services.AddMqCSFramework(builder.Configuration)`
-- **Automatic retry + dead-letter** — configurable retry count with error queue routing
+- **Broker-side dead-letter + retry** — failed messages go to the queue's dead-letter exchange; opt-in `Retry` lets RabbitMQ retry them with a delay on quorum queues (RabbitMQ 4.3+) ([details](docs/configuration.md#retries-and-dead-lettering))
 - **Publisher confirms** — opt-in `ConfirmPublish` so a message the broker didn't accept fails instead of vanishing. Off by default; turn it on for fire-and-forget senders ([details](docs/configuration.md#publisher-confirms-confirmpublish))
 - **Structured logging** — Serilog with configurable sensitive field masking
 

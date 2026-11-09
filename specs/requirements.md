@@ -7,7 +7,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 **Project name:** MqCSFramework
 **License:** MIT
 **Target:** .NET 10, C# 14
-**Broker:** RabbitMQ (via RabbitMQ.Client 7.x)
+**Broker:** RabbitMQ (via RabbitMQ.Client 7.x). Queues the consumer creates are quorum queues; retries (opt-in) use the broker's quorum delayed retry, which needs RabbitMQ 4.3 or later (Requirement 9)
 
 ## Glossary
 
@@ -89,7 +89,7 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 5. The host setting accepts one or more comma-separated `host` or `host:port` entries (the nodes of one cluster). An entry without a port uses the AMQP default (5672, or 5671 with TLS). The client tries the entries in random order for the initial connection and again when it auto-reconnects
 6. TLS, when enabled, applies to every host. The certificate name checked is a configurable server name, or each host's own name when none is set
 7. Opening a connection is bounded: the whole connect (TCP, TLS and AMQP handshake) is capped at the connection timeout per listed host and then fails with a timeout error, because the RabbitMQ client alone can wait forever when a server accepts TCP but never answers the handshake. A caller's cancellation still surfaces as a cancellation
-8. Publisher confirms (`ConfirmPublish`, default false) are a connection setting, so they apply to every sender and consumer: the channel is opened with publisher confirms and confirm tracking (at most 128 unconfirmed publishes at a time), and every publish — sender messages, RPC requests, and the consumer's RPC replies, retry republishes and dead-letter publishes — is sent with the mandatory flag so an unroutable message comes back as an error instead of being dropped
+8. Publisher confirms (`ConfirmPublish`, default false) are a connection setting, so they apply to every sender and consumer: the channel is opened with publisher confirms and confirm tracking (at most 128 unconfirmed publishes at a time), and every publish — sender messages, RPC requests, and the consumer's RPC replies — is sent with the mandatory flag so an unroutable message comes back as an error instead of being dropped
 
 ### Requirement 5: DI Integration
 
@@ -149,13 +149,11 @@ MqCSFramework is an open-source, lightweight RabbitMQ client/server framework fo
 #### Acceptance Criteria
 
 1. Processor exceptions do not crash the consumer loop
-2. Failed messages are NACK'd
-3. Dead-letter support: messages exceeding a retry limit are routed to an error queue
-4. This path applies to both standard and RPC processors: an unexpected exception from an RPC processor is NACK'd/retried/dead-lettered exactly like a standard message. No error response is published to the reply queue — business failures must instead be returned as an `RpcError` on the response (see Requirement 2)
-5. With publisher confirms on (`ConfirmPublish`), the consumer's own publishes are confirmed too. A retry or dead-letter republish the broker returns or rejects is logged and the original message is NACKed without requeue instead of being acknowledged (with confirms off, such a republish is lost and the original is still acknowledged). An RPC reply that cannot be delivered (the reply queue is gone, e.g. the sender stopped) is logged as a warning and the request is still acknowledged, so it is not processed again
-6. Retry and dead-letter copies keep the original message's persistence, so a persistent message stays persistent in the dead-letter queue
-7. Framework retry (the default): a failed message is retried by publishing a copy with `mq-retry-count` incremented straight to the consumer's own queue (default exchange, routing key = `QueueName`), never to the exchange it came through, so other queues bound to that exchange (fanout/topic) do not receive it again; the original is then acknowledged. `MaxRetries` is the number of retries: 0 means none, so the first failure goes to the dead-letter exchange, or is NACKed without requeue when none is configured
-8. Broker retry (`BrokerRetry = true`, RabbitMQ 4.3+): the consumer declares its queue as a quorum queue (`x-queue-type: quorum`; the queue type can only be set at declaration) and rejects a failed message with requeue (`basic.reject`, which increments the delivery count that drives the back-off and the delivery limit; `basic.nack` does not). The broker's delayed retry holds the message before redelivering it, and past the delivery limit dead-letters or drops it. Delay, limit and dead-lettering come from a RabbitMQ policy (`delayed-retry-type`, `delayed-retry-min`, `delayed-retry-max`, `delivery-limit`, `dead-letter-exchange`), as RabbitMQ recommends over queue arguments. `MaxRetries`, `DeadLetterExchange` and `DeadLetterRoutingKey` are not used in this mode
+2. The consumer uses an existing queue as it is: on startup it checks with a passive declare, and only when the queue does not exist (404) declares it as a quorum queue (`x-queue-type: quorum`). An existing queue of any type or arguments (classic, quorum, with a DLX or TTL set by its creator) therefore never fails with 406 PRECONDITION_FAILED. The framework itself does not count, delay or republish
+3. `ConsumerOptions.Retry` (default false) chooses what happens when a processor throws. False: the message is rejected without requeue, so the broker dead-letters it through the queue's dead-letter exchange, or drops it when there is none; this is safe on every queue type. True: the message is rejected with requeue (`basic.reject`, which increments the quorum delivery count that drives the back-off and the delivery limit; `basic.nack` does not), so the broker retries it. On a quorum queue (RabbitMQ 4.3+) delay, retry limit and dead-lettering come from a RabbitMQ policy (`delayed-retry-type`, `delayed-retry-min`, `delayed-retry-max`, `delivery-limit`, `dead-letter-exchange`); past the delivery limit (default 20) the broker dead-letters or drops it, and without a delayed-retry policy it is redelivered immediately. On a classic queue, which has neither delayed retry nor a delivery limit, it is redelivered immediately and forever; the documentation warns about this
+4. This path applies to both standard and RPC processors: an unexpected exception from an RPC processor is handled exactly like a standard message per AC 3. No error response is published to the reply queue — business failures must instead be returned as an `RpcError` on the response (see Requirement 2)
+5. With publisher confirms on (`ConfirmPublish`), the consumer's RPC replies are confirmed too. An RPC reply that cannot be delivered (the reply queue is gone, e.g. the sender stopped) is logged as a warning and the request is still acknowledged, so it is not processed again
+6. Messages that can never be processed (missing `mq-processor-type` or `mq-pattern` header, unknown or unregistered processor type, wrong processor interface) are NACKed without requeue whatever `Retry` is, so the broker dead-letters them right away (or drops them when the queue has no dead-letter exchange)
 
 ## Non-Functional Requirements
 
